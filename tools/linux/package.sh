@@ -46,6 +46,8 @@ cp third_party/fonts/BIZUDPGothic/BIZUDPGothic-Regular.ttf "$APPDIR/usr/bin/"  #
 cp third_party/fonts/BIZUDPGothic/OFL.txt "$APPDIR/usr/bin/BIZUDPGothic-OFL.txt"
 cp third_party/fonts/DejaVu/DejaVuSans.ttf third_party/fonts/DejaVu/DejaVuSans-Bold.ttf "$APPDIR/usr/bin/"  # (last-resort fonts, free license)
 cp third_party/fonts/DejaVu/LICENSE "$APPDIR/usr/bin/DejaVu-LICENSE.txt"
+cp third_party/fonts/OpenPadGlyphs/OpenPadGlyphs.ttf "$APPDIR/usr/bin/"  # (in-text button glyphs without the console font, OFL)
+cp third_party/fonts/OpenPadGlyphs/OFL.txt "$APPDIR/usr/bin/OpenPadGlyphs-OFL.txt"
 cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bundled components: README "License")
 [ -d "$L/helper/rando-gen" ] || { echo "no seed generator helper: tools/linux/rando_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/rando-gen" "$APPDIR/usr/bin/"

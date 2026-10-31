@@ -105,6 +105,9 @@ files or fonts.
   sized like the console's font, where macOS / Windows use Hiragino / Yu Gothic; the in-game menu and button letters
   use DejaVu Sans, the system's or the bundled copy (`third_party/fonts/DejaVu`). TrueType is required; the game's font
   engine can't use CFF fonts such as Noto Sans CJK.
+- In-text button glyphs (the NintendoExt font) without the user's Switch fonts: the bundled Open Pad Glyphs
+  (`third_party/fonts/OpenPadGlyphs`). Chinese / Korean: a TrueType font of the language from the usual paths or
+  fontconfig (`fc-match`); Droid Sans Fallback covers all three.
 - Pages: 4K and 16K kernels (Asahi) work; 64K-page kernels (some ARM servers) are not supported.
 
 ## Testing on ARM (aarch64): what to report

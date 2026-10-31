@@ -9,6 +9,11 @@ so its text comes out the same size as on the console.
 For the exact look, put your own copies of the system fonts here:
 
 - `nintendo_udsg-r_std_003.bfttf`: the main font (a `.ttf` with the same name, or spelled `nintendo_udsgr_std_003`, also works)
-- `nintendo_ext_003.bfttf`: button glyphs (optional)
+- `nintendo_ext_003.bfttf`: button glyphs (optional: without it the bundled Open Pad Glyphs draw them,
+  `third_party/fonts/OpenPadGlyphs`, in the connected controller's labels and following your button bindings;
+  `LARECOMP_BUTTON_GLYPHS=auto|nintendo|xbox|playstation` picks the labels. They are chosen at start.)
+
+Chinese and Korean text without the console's fonts uses a TrueType font of that language from the system (common
+distribution paths, then fontconfig). CFF fonts such as Noto Sans CJK can't be used: the game's font engine needs TrueType.
 
 `LARECOMP_FONT=<file>` overrides everything (.ttf / .otf / .ttc / .bfttf).
