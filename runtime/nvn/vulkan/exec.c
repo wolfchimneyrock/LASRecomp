@@ -3877,6 +3877,15 @@ void backend_guest_heap_prepare(void) {
     if (!g_vk.host_import || getenv("LARECOMP_VK_NO_GMEM") || g_vk.props.vendorID == 0x10DE) return;
     gmem_userptr = true;
     plat_write_tracking_off(gc_lazy ? "the guest heap is imported in userptr chunks" : "the guest heap is a userptr import");
+    // ARM's Mali driver (kbase) pins an imported host allocation's pages and maps them in the GPU's own MMU: no MMU
+    // notifier, nothing checks the CPU's page table again at a submission, so changing the CPU's protection of the
+    // pages costs the GPU nothing (unlike amdgpu's userptr above). There the soft tracking (mprotect + SIGSEGV, as over
+    // the dma-buf heap) gives the storage write watch, and with it the GPU overlap, also on kernels without
+    // userfaultfd / PAGEMAP_SCAN (Rockchip's 6.1). Private anonymous pages keep their physical page across the
+    // protect / fault / unprotect cycle (an exclusive anonymous page is reused, not copied), so the GPU keeps reading
+    // what the CPU wrote. LARECOMP_SOFT_WRITE_TRACKING=1: the same over any userptr import (tests), =0: off.
+    const char *st = getenv("LARECOMP_SOFT_WRITE_TRACKING");
+    if (st ? atoi(st) != 0 : g_vk.props.vendorID == 0x13B5) plat_soft_write_tracking(HEAP_BASE, HEAP_BASE + HEAP_MAX);
 #endif
 }
 
