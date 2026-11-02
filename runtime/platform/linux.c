@@ -185,7 +185,9 @@ static int soft_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, int
     if (addr < g_soft_lo || addr + size > g_soft_hi || max <= 0) return -1;
     atomic_fetch_add(&g_soft_inflight, 1);
     int n;
-    if (atomic_load(&g_soft_hold)) {  // (an import is pinning pages: protect nothing, every page counts as written)
+    static int noprot = -1;
+    if (noprot < 0) { const char *e = getenv("LARECOMP_SOFT_NOPROTECT"); noprot = e && atoi(e); }  // (tests: never protect)
+    if (atomic_load(&g_soft_hold) || noprot) {  // (an import is pinning pages: protect nothing, every page counts as written)
         // The marks stay set: the pages stay open meanwhile, so a CPU write to one now neither faults nor marks it; the
         // first query after the hold arms the page and must still report it (once more: the safe side).
         uint64_t first = (addr - g_soft_lo) / SOFT_PAGE, last = (addr + size - 1 - g_soft_lo) / SOFT_PAGE;
