@@ -121,6 +121,10 @@ typedef struct {
     bool glsl;               // emit Vulkan GLSL: dialect-specific constructs here, the rest via glsl_rewrite()
     bool uses_gmem_store;    // STG present: the gmem buffer is not readonly
     uint32_t cbuf_need[18];  // highest constant vec4 index + 1 per cbuf (array size of the GLSL block)
+    // GLSL, LARECOMP_VK_STATIC_STACKS: every SYNC / BRK / CONT's target resolved at translation time
+    // (static_stacks_resolve): the pops become plain jumps and the SSY / PBK / PCNT stacks go away
+    bool static_stacks;
+    uint32_t *pop_target;  // per instruction word: the pc a SYNC / BRK / CONT goes to
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -910,12 +914,14 @@ static void light_tiles_fix(Ctx *c, const uint64_t *code, size_t end, uint32_t p
 // A push / pop on stack `n` (ssy, pbk, pcnt). GLSL (maxwell_glsl_stack_vars, shader.h): 16 named variables, the
 // index masked; otherwise (and MSL) an array of 16.
 static void stack_push(Ctx *c, const char *n, uint32_t v) {
+    if (c->static_stacks) return;  // (its pops know their target)
     if (!c->glsl || !maxwell_glsl_stack_vars) { sp(&c->body, "    %s[%s_n++] = %uu;\n", n, n, v); return; }
     sp(&c->body, "    { uint i_ = (%s_n++) & 15u;", n);
     for (int k = 0; k < 16; k++) sp(&c->body, " %sif (i_ == %du) %s%d = %uu;", k ? "else " : "", k, n, k, v);
     sp(&c->body, " }\n");
 }
-static void stack_pop(Ctx *c, const char *n, bool keep) {  // keep: the top stays (CONT)
+static void stack_pop(Ctx *c, const char *n, bool keep, uint32_t pc) {  // keep: the top stays (CONT)
+    if (c->static_stacks) { sp(&c->body, "    pc = %uu; continue;\n", c->pop_target[pc / 8]); return; }
     if (!c->glsl || !maxwell_glsl_stack_vars) {
         sp(&c->body, keep ? "    pc = %s[%s_n - 1]; continue;\n" : "    pc = %s[--%s_n]; continue;\n", n, n);
         return;
@@ -966,11 +972,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->uses_branches = true;
         stack_push(c, "pcnt", norm_target((int64_t)pc + 8 + sbits(w, 20, 24)));
     } else if (OPM(0xf0f8000000000000ull, 0xfff8000000000000ull)) {  // SYNC
-        stack_pop(c, "ssy", false);
+        stack_pop(c, "ssy", false, pc);
     } else if (OPM(0xe340000000000000ull, 0xfff0000000000000ull)) {  // BRK
-        stack_pop(c, "pbk", false);
+        stack_pop(c, "pbk", false, pc);
     } else if (OPM(0xe350000000000000ull, 0xfff0000000000000ull)) {  // CONT
-        stack_pop(c, "pcnt", true);
+        stack_pop(c, "pcnt", true, pc);
     } else if (OPM(0xf0f0000000000000ull, 0xfff8000000000000ull) || OPM(0x50b0000000000000ull, 0xfff8000000000000ull) ||
                OPM(0xef98000000000000ull, 0xfff8000000000000ull)) {
         // DEPBAR / NOP / MEMBAR
@@ -2153,7 +2159,9 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     if (c->uses_local) sp(&s, "  uint lmem[%d]; for (int li_ = 0; li_ < %d; li_++) lmem[li_] = 0u;\n", LMEM_WORDS, LMEM_WORDS);
     if (dbg) sp(&s, maxwell_dbg_pc == 0xffffffffu ? "  float dbgv = 1.0f;\n" : "  float dbgv = -1.0f;\n");
     if (any_branch) {
-        if (maxwell_glsl_stack_vars) {
+        if (c->static_stacks) {
+            sp(&s, "  uint pc = 8u;\n");  // (the pops jump to resolved targets: no stacks)
+        } else if (maxwell_glsl_stack_vars) {
             sp(&s, "  uint pc = 8u; uint ssy_n = 0u, pbk_n = 0u, pcnt_n = 0u;\n");
             static const char *const stk[] = {"ssy", "pbk", "pcnt"};
             for (int j = 0; j < 3; j++) {
@@ -2265,6 +2273,73 @@ static bool brx_table_labels(const uint8_t *code, size_t i, size_t end, const ui
     return n > 0;
 }
 
+// LARECOMP_VK_STATIC_STACKS=1 (GLSL): the SSY / PBK / PCNT stacks only hold branch targets, and in compiled code
+// their contents at each instruction are the same on every path that reaches it. Walk every path from the entry
+// with the stacks' contents; where two paths meet (a label) they must agree. Then each SYNC / BRK / CONT has one
+// target, and the shader needs no stacks: 48 slots fewer, which spare the registers (or the stack memory) that
+// the driver's compiler otherwise spends on them. Returns false (keep the stacks) on anything else: an indirect
+// jump (BRX), a call / return, a stack over- or underflow, or paths that disagree.
+typedef struct { uint8_t n[3]; uint32_t v[3][16]; } StackState;
+static bool static_stacks_resolve(const uint64_t *code, size_t end, const uint8_t *label, uint32_t *pop_target) {
+    StackState *at = calloc(end + 1, sizeof *at);
+    uint8_t *seen = calloc(end + 1, 1);
+    size_t *work = malloc((end + 1) * sizeof *work);
+    size_t nwork = 0;
+    bool ok = true;
+#define ENQ(idx, st) do { size_t e_ = (idx); \
+        if (e_ >= end || !label[e_]) { ok = false; break; } \
+        if (seen[e_]) { if (memcmp(&at[e_], (st), sizeof(StackState))) ok = false; break; } \
+        seen[e_] = 1; at[e_] = *(st); work[nwork++] = e_; } while (0)
+    StackState s0 = {{0}};
+    ENQ(1, &s0);
+    while (ok && nwork) {
+        size_t i = work[--nwork];
+        StackState s = at[i];
+        for (bool first = true; ok; first = false, i++) {
+            if (i % 4 == 0) continue;
+            if (i >= end) break;                                   // past the last instruction: the end
+            if (!first && label[i]) { ENQ(i, &s); break; }        // falls into a label: a meeting point
+            uint64_t w = code[i];
+            uint64_t top12 = w & 0xfff0000000000000ull;
+            int pr = (int)bits(w, 16, 3);
+            bool prn = bits(w, 19, 1);
+            int k = top12 == 0xe290000000000000ull ? 0 : top12 == 0xe2a0000000000000ull ? 1 : top12 == 0xe2b0000000000000ull ? 2 : -1;
+            if (k >= 0 && !(w & 0x20)) {                           // SSY / PBK / PCNT: push (never predicated)
+                if (s.n[k] >= 16) { ok = false; break; }
+                s.v[k][s.n[k]++] = norm_target((int64_t)(i * 8) + 8 + sbits(w, 20, 24));
+                continue;
+            }
+            if (pr == PT && prn) continue;                         // @!PT: never runs
+            bool guarded = !(pr == PT && !prn);
+            if (top12 == 0xe200000000000000ull || top12 == 0xe210000000000000ull || top12 == 0xe250000000000000ull ||
+                top12 == 0xe260000000000000ull || top12 == 0xe270000000000000ull || top12 == 0xe280000000000000ull ||
+                top12 == 0xe310000000000000ull || top12 == 0xe320000000000000ull) { ok = false; break; }  // JMP JMX BRX CAL PRET PLONGJMP LONGJMP RET
+            if ((w & 0xfff0000000000020ull) == 0xe240000000000000ull) {  // BRA
+                ENQ(norm_target((int64_t)(i * 8) + 8 + sbits(w, 20, 24)) / 8, &s);
+                if (!guarded) break;
+                continue;
+            }
+            if (top12 == 0xe300000000000000ull) { if (!guarded) break; continue; }  // EXIT
+            int pk = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull ? 0 : top12 == 0xe340000000000000ull ? 1 :
+                     top12 == 0xe350000000000000ull ? 2 : -1;      // SYNC / BRK / CONT
+            if (pk >= 0) {
+                if (!s.n[pk]) { ok = false; break; }
+                uint32_t tgt = s.v[pk][s.n[pk] - 1];
+                if (pop_target[i] && pop_target[i] != tgt) { ok = false; break; }
+                pop_target[i] = tgt;
+                StackState t = s;
+                if (pk != 2) t.n[pk]--;                            // (CONT keeps the loop's entry)
+                ENQ(tgt / 8, &t);
+                if (!guarded) break;
+                continue;
+            }
+        }
+    }
+#undef ENQ
+    free(at); free(seen); free(work);
+    return ok;
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2319,6 +2394,18 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         (void)is_branch_target_op;
     }
+    if (any_branch && c->glsl) {
+        static int ss = -1;
+        if (ss < 0) { const char *e = getenv("LARECOMP_VK_STATIC_STACKS"); ss = e && atoi(e) != 0; }
+        if (ss) {
+            c->pop_target = calloc(end + 1, sizeof *c->pop_target);
+            c->static_stacks = static_stacks_resolve((const uint64_t *)code, end, label, c->pop_target);
+            static unsigned ss_yes, ss_no;  // (a progress line now and then: how many shaders lost their stacks)
+            if (c->static_stacks) ss_yes++; else ss_no++;
+            if ((ss_yes + ss_no) % 500 == 0)
+                fprintf(stderr, "[shader] static stacks: %u branchy shaders resolved, %u kept their stacks\n", ss_yes, ss_no);
+        }
+    }
     // translate
     bool dbg = maxwell_dbg_code && blob == maxwell_dbg_code && stage == STAGE_FRAGMENT;
     static int annotate = -1;
@@ -2340,6 +2427,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         info->num_insts++;
     }
     free(label);
+    free(c->pop_target);
+    c->pop_target = NULL;
     // (MSL: more textures than sampler slots take a slot table, at a buffer index the vertex stage's streams use)
     if (!c->glsl && stage == STAGE_VERTEX && info->ntex > MSL_MAX_SAMPLERS)
         fail(c, "%d textures in a vertex shader (Metal: %d samplers)", info->ntex, MSL_MAX_SAMPLERS);
