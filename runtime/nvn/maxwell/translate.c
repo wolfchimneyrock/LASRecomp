@@ -2333,7 +2333,8 @@ static bool static_stacks_resolve(const uint64_t *code, size_t end, const uint8_
                 if (pop_target[i] && pop_target[i] != tgt) { ok = false; why = 6; break; }
                 pop_target[i] = tgt;
                 StackState t = s;
-                if (pk != 2) t.n[pk]--;                            // (CONT keeps the loop's entry)
+                if (pk != 2) t.v[pk][--t.n[pk]] = 0;               // (CONT keeps the loop's entry; a popped slot is
+                                                                   //  cleared: states are compared whole)
                 ENQ(tgt / 8, &t);
                 if (!guarded) break;
                 continue;
@@ -2441,7 +2442,7 @@ static bool struct_blocks(const uint64_t *code, size_t end, const uint8_t *label
     bool cut = true;  // the next instruction starts a block
     for (size_t i = 0; i < end; i++) {
         if (i % 4 == 0) { blk_of[i] = -1; continue; }
-        if (cut || label[i]) { if (nb) b[nb - 1].last = i - 1; b[nb] = (SBlock){i, i, TERM_NONE, PT, false, -1}; nb++; cut = false; }
+        if (cut || label[i]) { if (nb) b[nb - 1].last = (i - 1) % 4 ? i - 1 : i - 2;  /* (its last instruction, not a scheduling word) */ b[nb] = (SBlock){i, i, TERM_NONE, PT, false, -1}; nb++; cut = false; }
         blk_of[i] = nb - 1;
         uint64_t w = code[i], top12 = w & 0xfff0000000000000ull;
         int pr = (int)bits(w, 16, 3);
@@ -2458,7 +2459,7 @@ static bool struct_blocks(const uint64_t *code, size_t end, const uint8_t *label
         k->target = is_bra ? (int)(norm_target((int64_t)(i * 8) + 8 + sbits(w, 20, 24)) / 8) : is_pop ? (int)(pop_target[i] / 8) : -1;
         cut = true;
     }
-    if (nb) b[nb - 1].last = end - 1;
+    if (nb) b[nb - 1].last = (end - 1) % 4 ? end - 1 : end - 2;
     for (int k = 0; k < nb; k++) {  // targets: word -> block (a target starts a block: it is a label)
         if (b[k].term != TERM_BRANCH) continue;
         int w = b[k].target;
