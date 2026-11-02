@@ -3972,6 +3972,20 @@ void backend_guest_heap_prepare(void) {
     // refuses a range without userfaultfd write protection), so it's off there too
     if (gmem_dmabuf) {
         plat_write_tracking_off("the guest heap is driver memory");
+        // Every page faulted in once before soft tracking protects any: mprotect splits the mapping, and a GEM mmap
+        // whose fault handler counts the page from the split part's start (drm_gem_shmem_fault: PanVK / Panthor)
+        // would then map a later page from the wrong place in the buffer. Pages already mapped keep their entries
+        // through mprotect. (The memory is all committed anyway: the GPU's mapping pins it.) RADV's handler is right:
+        // not there. LARECOMP_VK_HEAP_PREFAULT=0 / 1: off / on.
+        const char *pf = getenv("LARECOMP_VK_HEAP_PREFAULT");
+        const char *st = getenv("LARECOMP_SOFT_WRITE_TRACKING");
+        if ((pf ? atoi(pf) != 0 : !strstr(g_vk.props.deviceName, "RADV")) && !(st && !atoi(st))) {
+            uint64_t t0 = SDL_GetTicksNS();
+            volatile const uint8_t *h = (volatile const uint8_t *)(uintptr_t)HEAP_BASE;
+            for (uint64_t o = 0; o < HEAP_MAX; o += 4096) (void)h[o];
+            LOG("[vk] heap as driver memory: %llu MB faulted in for soft tracking in %llu ms\n",
+                (unsigned long long)(HEAP_MAX >> 20), (unsigned long long)((SDL_GetTicksNS() - t0) / 1000000));
+        }
         plat_soft_write_tracking(HEAP_BASE, HEAP_BASE + HEAP_MAX);  // (no userptr: a protection change is the CPU's alone)
         return;
     }
