@@ -3789,10 +3789,14 @@ static void heap_unmap_placed(void) {
     gmem_placed = false;
 }
 
-static bool guest_heap_dmabuf(void) {
-    if (gmem_buf || !g_vk.dev || !(g_vk.dmabuf || g_vk.map_placed) || getenv("LARECOMP_VK_NO_GMEM")) return false;
+// Whether the heap is to be the driver's memory (gmir_on asks this before the heap is set up: no copies then)
+static bool heap_dmabuf_wanted(void) {
+    if (!g_vk.dev || !(g_vk.dmabuf || g_vk.map_placed) || getenv("LARECOMP_VK_NO_GMEM")) return false;
     const char *e = getenv("LARECOMP_VK_HEAP_DMABUF");
-    if (e ? !atoi(e) : !strstr(g_vk.props.deviceName, "RADV")) return false;
+    return e ? atoi(e) != 0 : strstr(g_vk.props.deviceName, "RADV") != NULL;
+}
+static bool guest_heap_dmabuf(void) {
+    if (gmem_buf || !heap_dmabuf_wanted()) return false;
     const uint64_t size = HEAP_MAX;
     VkPhysicalDeviceMemoryProperties mp;
     vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
@@ -4716,7 +4720,11 @@ static bool gmir_on(void) {
         const char *e = getenv("LARECOMP_VK_GMEM_MIRROR");
         on = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GMEM") && (!e || atoi(e) != 0);
 #ifdef __linux__
-        if (gmem_dmabuf) on = 0;  // (the heap is the driver's memory: shaders read it directly, no copies)
+        if (on && heap_dmabuf_wanted()) {  // (the heap will be the driver's memory: shaders read it directly)
+            on = 0;
+            LOG("[vk] shader global memory: the heap as driver memory, no copies\n");
+            return on;
+        }
 #endif
         if (on) LOG("[vk] shader global memory: copies of the bound buffers (no host memory import here)\n");
         else if (!g_vk.host_import) LOG("[vk] shader global memory: no host memory import and no copies: reads return zero\n");
