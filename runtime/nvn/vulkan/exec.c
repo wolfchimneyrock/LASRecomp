@@ -116,6 +116,9 @@ static int pages_cpu_written(uint64_t addr, uint64_t size, uint32_t since, uint3
 static const char *heap_tracking_reason(void);  // (why the heap has no page write tracking, for the log)
 static bool gmir_on(void);         // (shader global memory as copies: no heap import, issue #483)
 static void gmir_writeback(void);  // (... what the GPU stored, into guest memory)
+#ifdef __linux__
+static bool gmem_mprotect_broken;  // (exec.c guest heap: driver memory that page protection corrupts)
+#endif
 static bool overlap_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -128,6 +131,10 @@ static bool overlap_on(void) {
         }
         bool tracked = (!w || atoi(w) != 0) && pages_cpu_written(HEAP_BASE, 4096, 0, &g) >= 0;
         if (e) on = atoi(e) != 0;
+#ifdef __linux__
+        else if (VK_OVERLAP_DEFAULT && !tracked && gmem_mprotect_broken) on = 1;  // (driver memory without page
+                                                                                  //  protection: the hash probe)
+#endif
         else if (VK_OVERLAP_DEFAULT && !tracked) {
             on = 0;
             LOG("[vk] GPU overlap off: no page write tracking on this system (%s); LARECOMP_GPU_OVERLAP=1 forces it on\n",
@@ -3743,6 +3750,7 @@ static bool gmem_import(uint64_t size) {
 #ifdef __linux__
 static bool gmem_dmabuf;  // the heap is the driver's memory mapped at HEAP_BASE
 static bool gmem_placed;  // ... by the driver (vkMapMemory2KHR, placed): unmapped through it at a reboot
+static uint32_t gmem_dmabuf_type;  // (its memory type)
 
 // The driver maps `mem` (HEAP_MAX, one allocation) at HEAP_BASE. NULL, or why not; HEAP_BASE is ordinary guest
 // memory again after a failure.
@@ -3871,6 +3879,7 @@ static bool guest_heap_dmabuf(void) {
     VkResult r = vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
     if (r != VK_SUCCESS) { LOG("[vk] heap as driver memory: allocation failed (%d)\n", r); vkDestroyBuffer(g_vk.dev, buf, NULL); return false; }
     heap_note_type((uint32_t)type);
+    gmem_dmabuf_type = (uint32_t)type;
     const char *why = NULL;
     if (placed) {
         why = vkBindBufferMemory(g_vk.dev, buf, mem, 0) != VK_SUCCESS ? "binding failed" : heap_map_placed(mem);
@@ -3960,6 +3969,34 @@ static const char *heap_tracking_reason(void) {  // (overlap_on: why there is no
 // The whole heap as one userptr import (not chunks) on AMD: each submission has amdgpu check all of its pages
 static bool heap_whole_userptr(void) { return gmem_userptr && !gc_lazy && g_vk.props.vendorID == 0x1002; }
 
+#ifdef __linux__
+// One page of a scratch allocation (the heap's memory type) protected and opened again: do the other pages still show
+// their own contents? (64 pages; each holds its index.)
+static bool heap_mprotect_safe(void) {
+    const char *e = getenv("LARECOMP_SOFT_WRITE_TRACKING");
+    if (e) return atoi(e) != 0;  // (as asked: no test)
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = 64 * 4096,
+                               .memoryTypeIndex = gmem_dmabuf_type};
+    VkDeviceMemory mem;
+    void *m = NULL;
+    if (vkAllocateMemory(g_vk.dev, &ai, NULL, &mem) != VK_SUCCESS) return false;
+    bool ok = vkMapMemory(g_vk.dev, mem, 0, VK_WHOLE_SIZE, 0, &m) == VK_SUCCESS;
+    if (ok) {
+        volatile uint64_t *w = (volatile uint64_t *)m;
+        for (int p = 0; p < 64; p++) w[p * 512] = (uint64_t)p + 1;
+        ok = !mprotect((uint8_t *)m + 33 * 4096, 4096, PROT_READ) && !mprotect((uint8_t *)m + 33 * 4096, 4096, PROT_READ | PROT_WRITE);
+        for (int p = 0; ok && p < 64; p++) ok = w[p * 512] == (uint64_t)p + 1;
+        if (ok) for (int p = 0; p < 64; p++) w[p * 512] = 0;  // (and writes land where they belong)
+        vkUnmapMemory(g_vk.dev, mem);
+    }
+    vkFreeMemory(g_vk.dev, mem, NULL);
+    LOG("[vk] heap as driver memory: page protection %s\n", ok ? "keeps the mapping: soft write tracking on"
+        : "moves the mapping's pages (the driver's fault handler after a split, Linux's drm_gem_shmem_fault): no soft "
+          "write tracking; the GPU overlap goes by the hash probe");
+    return ok;
+}
+#endif
+
 void backend_guest_heap_prepare(void) {
     gmem_userptr = false;
 #ifdef __linux__
@@ -3972,19 +4009,13 @@ void backend_guest_heap_prepare(void) {
     // refuses a range without userfaultfd write protection), so it's off there too
     if (gmem_dmabuf) {
         plat_write_tracking_off("the guest heap is driver memory");
-        // Every page faulted in once before soft tracking protects any: mprotect splits the mapping, and a GEM mmap
-        // whose fault handler counts the page from the split part's start (drm_gem_shmem_fault: PanVK / Panthor)
-        // would then map a later page from the wrong place in the buffer. Pages already mapped keep their entries
-        // through mprotect. (The memory is all committed anyway: the GPU's mapping pins it.) RADV's handler is right:
-        // not there. LARECOMP_VK_HEAP_PREFAULT=0 / 1: off / on.
-        const char *pf = getenv("LARECOMP_VK_HEAP_PREFAULT");
-        const char *st = getenv("LARECOMP_SOFT_WRITE_TRACKING");
-        if ((pf ? atoi(pf) != 0 : !strstr(g_vk.props.deviceName, "RADV")) && !(st && !atoi(st))) {
-            uint64_t t0 = SDL_GetTicksNS();
-            volatile const uint8_t *h = (volatile const uint8_t *)(uintptr_t)HEAP_BASE;
-            for (uint64_t o = 0; o < HEAP_MAX; o += 4096) (void)h[o];
-            LOG("[vk] heap as driver memory: %llu MB faulted in for soft tracking in %llu ms\n",
-                (unsigned long long)(HEAP_MAX >> 20), (unsigned long long)((SDL_GetTicksNS() - t0) / 1000000));
+        // Soft tracking protects single pages: mprotect splits the mapping, and a GEM mmap whose fault handler counts
+        // the page from the split part's start (drm_gem_shmem_fault: Panthor / PanVK, Linux 7.2) then maps every later
+        // page from the wrong place in the buffer - the game's data moves. Tried first on a scratch allocation of the
+        // same type; where it breaks, no soft tracking (the overlap then goes by the hash probe, overlap_on).
+        if (!heap_mprotect_safe()) {
+            gmem_mprotect_broken = true;
+            return;
         }
         plat_soft_write_tracking(HEAP_BASE, HEAP_BASE + HEAP_MAX);  // (no userptr: a protection change is the CPU's alone)
         return;
