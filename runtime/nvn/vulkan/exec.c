@@ -3995,9 +3995,20 @@ void backend_guest_heap_prepare(void) {
         if (!(st && !atoi(st)) && !(pf && !atoi(pf))) {
             uint64_t t0 = SDL_GetTicksNS();
             int r = madvise((void *)(uintptr_t)HEAP_BASE, HEAP_MAX, MADV_NOHUGEPAGE);
-            volatile const uint8_t *h = (volatile const uint8_t *)(uintptr_t)HEAP_BASE;
-            for (uint64_t o = 0; o < HEAP_MAX; o += 4096) (void)h[o];
-            LOG("[vk] heap as driver memory: every page mapped for soft tracking, no huge pages%s (%llu ms)\n",
+            // Mapped without leaving the data in the CPU's caches: a line read now would stay stale once the GPU writes
+            // there (the memory is not coherent, and only the ranges known to be the GPU's are invalidated later).
+            // MADV_POPULATE_READ maps without reading; where the driver mapping refuses it (VM_PFNMAP), each page is
+            // touched and its line cleaned and invalidated at once.
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+            bool populated = !r && madvise((void *)(uintptr_t)HEAP_BASE, HEAP_MAX, MADV_POPULATE_READ) == 0;
+            if (!r && !populated) {
+                volatile const uint8_t *h = (volatile const uint8_t *)(uintptr_t)HEAP_BASE;
+                for (uint64_t o = 0; o < HEAP_MAX; o += 4096) { (void)h[o]; plat_cache_op(HEAP_BASE + o, 64, true); }
+            }
+            LOG("[vk] heap as driver memory: every page mapped for soft tracking (%s), no huge pages%s (%llu ms)\n",
+                populated ? "MADV_POPULATE_READ" : "touched, its cache line cleaned and invalidated",
                 r ? " - madvise failed: soft tracking off" : "", (unsigned long long)((SDL_GetTicksNS() - t0) / 1000000));
             if (r) { gmem_mprotect_broken = true; return; }
         }
