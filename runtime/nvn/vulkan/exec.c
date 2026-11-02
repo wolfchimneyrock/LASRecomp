@@ -3814,6 +3814,19 @@ static bool guest_heap_dmabuf(void) {
             "trying it anyway\n", (unsigned long long)(largest >> 20), (unsigned long long)(size >> 20));
         type = largest_type;
     }
+    // No cached coherent type (Mesa's PanVK on Mali: type 2 is HOST_VISIBLE | HOST_CACHED, not coherent): a cached one
+    // that isn't. heap_note_type then turns on the CPU cache maintenance (DC CVAC / CIVAC around the GPU's use, as for
+    // Arm's driver's host-pointer import). Cached matters: the game's CPU work runs in this memory, and its exclusive
+    // loads / stores (locks, atomics) fault on uncached memory (#483, the uncached heap: SIGBUS on the first ldaxr).
+    if (type < 0 && !largest) {
+        const VkMemoryPropertyFlags want_nc = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+        for (uint32_t i = 0; i < mp.memoryTypeCount && type < 0; i++) {
+            if ((mp.memoryTypes[i].propertyFlags & want_nc) != want_nc) continue;
+            uint64_t hs = mp.memoryHeaps[mp.memoryTypes[i].heapIndex].size;
+            if (hs >= size) type = (int)i;
+        }
+        if (type >= 0) LOG("[vk] heap as driver memory: memory type %d, cached but not coherent (CPU cache maintenance)\n", type);
+    }
     if (type < 0) {
         if (largest)  // (Steam Deck: a 3072 MB system heap)
             LOG("[vk] heap as driver memory: the driver's cached system memory heap (%llu MB) is smaller than the guest heap "
@@ -4702,6 +4715,9 @@ static bool gmir_on(void) {
         if (!g_vk.dev) return false;  // (not decided before the device)
         const char *e = getenv("LARECOMP_VK_GMEM_MIRROR");
         on = !g_vk.host_import && !getenv("LARECOMP_VK_NO_GMEM") && (!e || atoi(e) != 0);
+#ifdef __linux__
+        if (gmem_dmabuf) on = 0;  // (the heap is the driver's memory: shaders read it directly, no copies)
+#endif
         if (on) LOG("[vk] shader global memory: copies of the bound buffers (no host memory import here)\n");
         else if (!g_vk.host_import) LOG("[vk] shader global memory: no host memory import and no copies: reads return zero\n");
     }
