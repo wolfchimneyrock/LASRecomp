@@ -135,8 +135,10 @@ void plat_soft_write_tracking(uint64_t lo, uint64_t hi) {
 }
 
 // Give page p its write access back and count it written (the fault handler and plat_os_write). False: not ours.
+static int soft_debug(void) { static int d = -1; if (d < 0) { const char *e = getenv("LARECOMP_SOFT_DEBUG"); d = e ? atoi(e) : 0; } return d; }
 static bool soft_release(uint64_t p) {
     uint8_t st = SOFT_ARMED;
+    if (soft_debug()) fprintf(stderr, "[soft] fault page %llx (state %d)\n", (unsigned long long)(g_soft_lo + p * SOFT_PAGE), (int)atomic_load(&g_soft_state[p]));
     if (atomic_compare_exchange_strong(&g_soft_state[p], &st, SOFT_RELEASING)) {
         atomic_store(&g_soft_written[p], 1);  // (before the page opens: a query that sees it open sees it written)
         mprotect((void *)(uintptr_t)(g_soft_lo + p * SOFT_PAGE), SOFT_PAGE, PROT_READ | PROT_WRITE);
@@ -155,6 +157,7 @@ static bool soft_fault(uint64_t fa) {
 
 void plat_os_write(uint64_t addr, uint64_t size) {
     if (!g_soft_state || !size || addr >= g_soft_hi || addr + size <= g_soft_lo) return;
+    if (soft_debug() > 1) fprintf(stderr, "[soft] os write %llx+%llx\n", (unsigned long long)addr, (unsigned long long)size);
     uint64_t a = addr < g_soft_lo ? g_soft_lo : addr, b = addr + size > g_soft_hi ? g_soft_hi : addr + size;
     for (uint64_t p = (a - g_soft_lo) / SOFT_PAGE; p <= (b - 1 - g_soft_lo) / SOFT_PAGE; p++)
         if (atomic_load(&g_soft_state[p]) == SOFT_ARMED) soft_release(p);
@@ -200,6 +203,7 @@ static int soft_written_pages_(uint64_t addr, uint64_t size, uint64_t *pages, in
         uint64_t q = p;
         while (q <= last && (st = atomic_load(&g_soft_state[q])) != SOFT_ARMED && st != SOFT_RELEASING) q++;
         for (uint64_t i = p; i < q; i++) atomic_store(&g_soft_state[i], SOFT_ARMED);
+        if (soft_debug()) fprintf(stderr, "[soft] protect %llx +%llu pages (query %llx+%llx)\n", (unsigned long long)(g_soft_lo + p * SOFT_PAGE), (unsigned long long)(q - p), (unsigned long long)addr, (unsigned long long)size);
         if (mprotect((void *)(uintptr_t)(g_soft_lo + p * SOFT_PAGE), (q - p) * SOFT_PAGE, PROT_READ)) {
             static int warned;
             if (warned++ < 5)
