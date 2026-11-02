@@ -3992,7 +3992,7 @@ void backend_guest_heap_prepare(void) {
         // permissions (and nothing here drops heap page entries later). About 2.5 s and 6.5 MB of page tables for
         // 3.3 GB. LARECOMP_VK_HEAP_PREFAULT=0: not done.
         const char *st = getenv("LARECOMP_SOFT_WRITE_TRACKING"), *pf = getenv("LARECOMP_VK_HEAP_PREFAULT");
-        if (!(st && !atoi(st)) && !(pf && !atoi(pf))) {
+        if ((!(st && !atoi(st)) && !(pf && !atoi(pf))) || (pf && atoi(pf) == 2)) {  // (=2: also without soft tracking, tests)
             uint64_t t0 = SDL_GetTicksNS();
             int r = madvise((void *)(uintptr_t)HEAP_BASE, HEAP_MAX, MADV_NOHUGEPAGE);
             // Mapped without leaving the data in the CPU's caches: a line read now would stay stale once the GPU writes
