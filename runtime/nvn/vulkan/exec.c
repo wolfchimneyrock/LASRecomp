@@ -119,6 +119,9 @@ static void gmir_writeback(void);  // (... what the GPU stored, into guest memor
 #ifdef __linux__
 static bool gmem_mprotect_broken;  // (exec.c guest heap: driver memory that page protection corrupts)
 #endif
+// The page the "is there write tracking?" probes query (a query may protect it): the top of the heap range, which
+// the game's heap never reaches - not HEAP_BASE, where the game's heap allocator keeps its header and lock.
+#define TRACK_PROBE_PAGE (HEAP_BASE + HEAP_MAX - 4096)
 static bool overlap_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -129,7 +132,7 @@ static bool overlap_on(void) {
             LOG("[vk] GPU overlap off: shader global memory goes through copies here\n");
             return on;
         }
-        bool tracked = (!w || atoi(w) != 0) && pages_cpu_written(HEAP_BASE, 4096, 0, &g) >= 0;
+        bool tracked = (!w || atoi(w) != 0) && pages_cpu_written(TRACK_PROBE_PAGE, 4096, 0, &g) >= 0;
         if (e) on = atoi(e) != 0;
 #ifdef __linux__
         else if (VK_OVERLAP_DEFAULT && !tracked && gmem_mprotect_broken) on = 1;  // (driver memory without page
@@ -3123,7 +3126,7 @@ static bool watch_on(void) {
         const char *e = getenv("LARECOMP_OVERLAP_WATCH");
         uint32_t g;
         on = !e || atoi(e) != 0;
-        if (on && pages_cpu_written(HEAP_BASE, 4096, 0, &g) < 0) {
+        if (on && pages_cpu_written(TRACK_PROBE_PAGE, 4096, 0, &g) < 0) {
             on = 0;
             LOG("[vk] storage write watch off: no page write tracking%s (the hash probe instead)\n", heap_is_userptr() ? " over a userptr heap import" : "");
         } else LOG("[vk] storage write watch %s (compute-bound ranges copied once the OS's page write tracking sees a CPU write; no page protection)\n",
@@ -5141,7 +5144,7 @@ static int pt_state = -1;  // 1: tracking, 0: none
 static bool pt_init(void) {
     if (pt_state >= 0) return pt_state;
     uint64_t pg = VC_PAGE, one;
-    int n = plat_written_pages(HEAP_BASE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
+    int n = plat_written_pages(TRACK_PROBE_PAGE, VC_PAGE, &one, 1, &pg);  // (is there write tracking?)
     pt_state = n >= 0 && pg == VC_PAGE;
     if (!pt_state) { LOG("[vk] no page write tracking (%d, page %llu)\n", n, (unsigned long long)pg); return false; }
     vc_page_gen = calloc(HEAP_MAX / VC_PAGE, sizeof *vc_page_gen);
