@@ -3486,7 +3486,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     // collect branch targets (labels)
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
-    bool any_branch = false;
+    bool any_branch = false, any_brx = false;  // (any_brx: even unreachable, the structurer can't place it)
     for (size_t i = 0; i < end; i++) {
         if (i % 4 == 0) continue;
         uint64_t w = ((const uint64_t *)code)[i];
@@ -3501,7 +3501,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         }
         if ((w & 0xfff0000000000000ull) == 0xe250000000000000ull) {  // BRX: its jump table's targets, else any instruction
-            any_branch = true;
+            any_branch = any_brx = true;
             if (!c->glsl || !brx_table_labels(code, i, end, blob, max_size, label)) memset(label, 1, end);
         }
         if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || (w & 0xfff0000000000000ull) == 0xe340000000000000ull ||
@@ -3527,7 +3527,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (c->static_stacks) {
         static int st = -1;
         if (st < 0) { const char *e = getenv("LARECOMP_VK_STRUCTURE"); st = e ? atoi(e) != 0 : maxwell_glsl_structured; }
-        if (st && struct_blocks((const uint64_t *)code, end, label, c->pop_target, &sblk, &nsblk, &blk_of)) {
+        if (st && !any_brx && struct_blocks((const uint64_t *)code, end, label, c->pop_target, &sblk, &nsblk, &blk_of)) {
             plan = ast_build(c, sblk, nsblk);
             c->structured = plan != NULL;
             if (plan) c->struct_vars = plan->nvars;
