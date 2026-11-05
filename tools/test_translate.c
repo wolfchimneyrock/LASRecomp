@@ -30,6 +30,7 @@ void old_maxwell_free(ShaderInfo *s);
 extern uint64_t old_maxwell_gmem_base, old_maxwell_gmem_size;
 
 static uint64_t rng_state, g_seed;
+static bool g_gss;  // TT_GMEM_SSBO=1: storage slots as their own buffers (maxwell_gmem_ssbo), programs that use them
 static uint64_t rnd64(void) {  // splitmix64
     uint64_t z = (rng_state += 0x9e3779b97f4a7c15ull);
     z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
@@ -163,6 +164,17 @@ static size_t gen_program(uint8_t *buf, size_t cap, int stage) {
     for (int g = 0; g < groups; g++) {
         code[i++] = rnd64();  // scheduling word
         for (int k = 0; k < 3; k++, i++) code[i] = gen_insn((uint32_t)i * 8, total);
+        if (g_gss && stage != STAGE_COMPUTE && rnd(100) < 40) {  // (TT_GMEM_SSBO) a storage slot's address, then a load
+            uint32_t win = stage == STAGE_FRAGMENT ? 0x510 : 0x110, desc = win + 16 * rnd(rnd(100) < 90 ? 3 : 16);
+            int ra = (int)rnd(20), rd = (int)rnd(24);
+            code[i - 3] = 0x4c98078000070000ull | (uint64_t)((desc >> 2) & 0x3fff) << 20 | (uint64_t)ra;  // MOV ra, c0[desc]
+            code[i - 2] = 0x4c98078000070000ull | (uint64_t)(((desc + 4) >> 2) & 0x3fff) << 20 | (uint64_t)(ra + 1);
+            uint64_t ldg = 0xeed0000000070000ull | (uint64_t)rnd(7) << 48 | (uint64_t)(rnd(100) < 85) << 45 |
+                           ((uint64_t)(rnd(100) < 70 ? 4 * rnd(64) : rnd(1 << 24)) & 0xFFFFFF) << 20 | (uint64_t)ra << 8 | (uint64_t)rd;
+            if (rnd(100) < 20) ldg = setf(ldg, 16, 4, rnd(7));  // (guarded)
+            if (rnd(100) < 15) code[i - 2] = setf(code[i - 2], 16, 4, rnd(7));  // (a guarded high word: not traced)
+            code[i - 1] = ldg;
+        }
     }
     code[i++] = 0x001f8000fc0007e0ull;
     code[i++] = 0xe30000000007000full;  // EXIT
@@ -224,6 +236,10 @@ int main(int argc, char **argv) {
     maxwell_glsl_stack_vars = !(getenv("TT_STACK_ARRAYS") && atoi(getenv("TT_STACK_ARRAYS")) != 0);
     // TT_GMEM_MIRROR=1: every stage through the address table, no heap behind it (no host import: exec.c gmir_)
     maxwell_gmem_mirror = getenv("TT_GMEM_MIRROR") && atoi(getenv("TT_GMEM_MIRROR")) != 0;
+    // TT_GMEM_SSBO=1: loads traced to a storage slot's descriptor read it as their own buffer (LARECOMP_VK_GMEM_SSBO);
+    // the programs then often load through a slot's address (gen_program)
+    maxwell_gmem_ssbo = g_gss = getenv("TT_GMEM_SSBO") && atoi(getenv("TT_GMEM_SSBO")) != 0;
+    long gss_shaders = 0, gss_only = 0;
 #ifdef WITH_GLSL
     shaderc_compiler_t comp = shaderc_compiler_initialize();
     shaderc_compile_options_t opt = shaderc_compile_options_initialize();
@@ -291,6 +307,7 @@ int main(int argc, char **argv) {
                         gl_vfail++;
                     } else {
                         gl_ok++;
+                        if (g->gss_mask) { gss_shaders++; if (!g->uses_gmem) gss_only++; }
                         by_stage[stage == STAGE_VERTEX ? 0 : stage == STAGE_FRAGMENT ? 1 : 2]++;
                         if (dir && gl_ok <= (getenv("TT_DUMP_OK") ? atol(getenv("TT_DUMP_OK")) : 40)) dump(dir, "glsl_ok", n, g->msl, NULL, prog, len);
                     }
@@ -308,6 +325,7 @@ int main(int argc, char **argv) {
                "%ld translation failures (%ld where MSL translated)\n",
                gl_ok, by_stage[0], by_stage[1], by_stage[2], gl_cfail, gl_vfail, gl_tfail, gl_tfail_only);
         for (int i = 0; i < nreasons; i++) printf("  translation failure: %-36s %ld\n", reasons[i], reason_n[i]);
+        if (g_gss) printf("  storage slots as their own buffers: %ld of them (%ld with no heap)\n", gss_shaders, gss_only);
     }
     return (msl_diff || gl_cfail || gl_vfail) ? 1 : 0;
 }

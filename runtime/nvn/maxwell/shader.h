@@ -84,6 +84,8 @@ typedef struct {
     uint8_t npush, push_cb[64];
     uint16_t push_off[64], push_base;  // (push_base: the block's offset in the push range, bytes)
     char error[256];        // set when translation fails
+    uint16_t gss_mask;      // (GLSL vertex / fragment, maxwell_gmem_ssbo) storage slots read as their own buffers GS<k>
+                            // (binding GSS_BINDING + k), each LDG traced to the slot's descriptor (translate.c gss_plan)
 } ShaderInfo;
 
 // Global memory (LDG/STG) is addressed through one buffer that wraps the guest heap.
@@ -140,6 +142,14 @@ extern uint32_t maxwell_push_base, maxwell_push_cap;
 // its storage buffers through the address table (GMap / GFast, as compute does), which points into copies of the
 // guest memory they cover (vulkan/exec.c gmir_). Accesses outside the table read 0 and drop their stores.
 extern bool maxwell_gmem_mirror;
+// (GLSL / Vulkan, LARECOMP_VK_GMEM_SSBO) Vertex / fragment loads whose address is a storage buffer descriptor (c0
+// 0x110 + 16 * i vertex, 0x510 + 16 * i fragment) plus an offset read that slot's range as their own storage buffer
+// GS<i> (binding GSS_BINDING + i of the stage's set; ShaderInfo.gss_mask), at (address - descriptor address + the
+// descriptor's fourth word, which the runtime sets to where the address sits in the binding: exec.c gss_prepare). Past
+// the range: the usual path; with the copies' table (maxwell_gmem_mirror) a shader whose every global access is such a
+// load takes no heap and no table, and reads 0 past its ranges (as the table does).
+extern bool maxwell_gmem_ssbo;
+#define GSS_BINDING 100
 // Lazy mode, vertex / fragment: the chunks under the draw's storage buffers (where the heap reads are) come as push
 // constants, GDirect { uvec4 gd[GMEM_DIRECT_MAX]; } (x = first word, y = words, 0: unused, z, w = device address), and
 // as storage buffers GDir<k> at GMEM_DIRECT_BINDING + k of the chunk set: an access in one is a compare and a plain

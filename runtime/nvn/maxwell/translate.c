@@ -32,6 +32,7 @@ bool maxwell_glsl_push;  // c1 inlined + push constants by default (exec.c: Mali
 const uint8_t *maxwell_const_data;
 uint32_t maxwell_const_size;
 bool maxwell_gmem_mirror;  // (shader.h)
+bool maxwell_gmem_ssbo;    // (shader.h)
 const uint8_t *maxwell_dbg_code;
 uint32_t maxwell_dbg_pc;
 int maxwell_dbg_reg;
@@ -131,6 +132,11 @@ typedef struct {
     bool structured;       // LARECOMP_VK_STRUCTURE: branches as nested if / else / do-while (ast_*), no pc state machine
     int struct_vars;       // its goto flags g0.. (GotoElimination)
     uint32_t *pop_target;  // per instruction word: the pc a SYNC / BRK / CONT goes to
+    // LARECOMP_VK_GMEM_SSBO (maxwell_gmem_ssbo, vertex / fragment): per instruction word, the storage slot an LDG's
+    // address comes from (gss_plan; -1: none), the slots used, and whether every global access is such a load
+    int8_t *gss_slot;
+    uint16_t gss_used;
+    bool gss_only;
 } Ctx;
 
 static uint64_t bits(uint64_t w, int lo, int n) { return (w >> lo) & ((n == 64) ? ~0ull : ((1ull << n) - 1)); }
@@ -948,6 +954,36 @@ static void stack_pop(Ctx *c, const char *n, bool keep, uint32_t pc) {  // keep:
     sp(&c->body, "%s15; } continue;\n", n);
 }
 
+// (GLSL, LARECOMP_VK_GMEM_SSBO: maxwell_gmem_ssbo) An LDG whose address is storage slot k's descriptor (driver
+// constants c0, the stage's window: gss_plan) plus an offset reads that slot's own storage buffer GS<k> (binding
+// GSS_BINDING + k), which the runtime binds over the slot's range; the descriptor's unused fourth word says where the
+// slot's address sits in that binding (exec.c gss_prepare). Opens `{ ulong gso = ...; if (inside) { ... } else {`:
+// the caller emits the usual heap access (or zeros, without a heap) and closes both.
+static void gss_load(Ctx *c, int k, const char *addr, int size, int nw, int d) {
+    uint32_t base = (c->stage == STAGE_FRAGMENT ? 0x510u : 0x110u) + 16u * (uint32_t)k;
+    char lo[64], hi[64], bias[64];
+    cbuf_ref(c, 0, base, NULL, lo);
+    cbuf_ref(c, 0, base + 4, NULL, hi);
+    cbuf_ref(c, 0, base + 12, NULL, bias);
+    c->gss_used |= (uint16_t)(1u << k);
+    sp(&c->body, "    { ulong gso = %s - ((ulong(%s) << 32 | ulong(%s)) - ulong(%s)); uint gsi = uint(gso >> 2);\n", addr, hi, lo, bias);
+    if (size < 4 || nw == 1) sp(&c->body, "      if (gso < ulong(gs%d_.w.length()) * 4ul) {\n", k);
+    else sp(&c->body, "      if (gso < ulong(gs%d_.w.length()) * 4ul && gsi + %du < uint(gs%d_.w.length())) {\n", k, nw - 1, k);
+    if (size < 4) {
+        static const char *const sm[] = {"(gs%d_.w[gsi] >> ((uint(gso) & 3u) * 8u)) & 0xFFu", "uint(sx8(gs%d_.w[gsi] >> ((uint(gso) & 3u) * 8u)))",
+                                         "(gs%d_.w[gsi] >> ((uint(gso) & 2u) * 8u)) & 0xFFFFu", "uint(sx16(gs%d_.w[gsi] >> ((uint(gso) & 2u) * 8u)))"};
+        if (d != RZ) {
+            char e[160];
+            snprintf(e, sizeof e, sm[size], k);
+            c->reg_used[d] = 1;
+            sp(&c->body, "        r%d = %s;\n", d, e);
+        }
+    } else
+        for (int j = 0; j < nw; j++)
+            if (d != RZ && d + j < RZ) { c->reg_used[d + j] = 1; sp(&c->body, "        r%d = gs%d_.w[gsi + %du];\n", d + j, k, j); }
+    sp(&c->body, "      } else {\n");
+}
+
 static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     char t[2048], u[2048];
     int d = (int)bits(w, 0, 8), a = (int)bits(w, 8, 8);
@@ -1540,16 +1576,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         bool wide = bits(w, 45, 1);
         int size = (int)bits(w, 48, 3);
         int64_t off = sbits(w, 20, 24);
-        c->info->uses_gmem = true;
         char addr[256];
         if (a == RZ) sprintf(addr, "ulong(%lld)", (long long)off);
         else if (wide) sprintf(addr, "((ulong(%s) << 32 | ulong(%s)) + ulong(%lld))", R(a + 1), R(a), (long long)off);
         else sprintf(addr, "(ulong(%s) + ulong(%lld))", R(a), (long long)off);
+        int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
+        int gk = c->gss_slot && !store ? c->gss_slot[pc / 8] : -1;
+        if (gk >= 0) gss_load(c, gk, addr, size, nw, d);  // (its own buffer; outside it, the heap below or zeros)
+        if (gk < 0 || !c->gss_only) {
+        c->info->uses_gmem = true;
         sp(&c->body, "    { ulong ga = %s - 0x%llxul; bool ok = ga < 0x%llxul;\n", addr,
            (unsigned long long)maxwell_gmem_base, (unsigned long long)maxwell_gmem_size);
         static const char *const ld_small[] = {"uint(gmem[ga])", "uint(int(char(gmem[ga])))",
                                                "uint(*(device ushort *)(gmem + ga))", "uint(int(*(device short *)(gmem + ga)))"};
-        int nw = size == 5 ? 2 : size >= 6 ? 4 : 1;
         bool lazy_wide = c->glsl && maxwell_gmem_chunk_shift && maxwell_gmem_lazy && nw > 1;  // (one chunk check per access)
         if (c->glsl && (c->stage == STAGE_COMPUTE || maxwell_gmem_mirror)) {
             // Compute (Vulkan): the guest heap is host memory across PCIe on a discrete GPU, and a shader storing to
@@ -1663,6 +1702,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
                     sp(&c->body, "      if (ok) *(device uint *)(gmem + ga + %du) = %s;\n", k * 4, R(d == RZ ? RZ : d + k));
         }
         sp(&c->body, "    }\n");
+        } else {  // (no heap: outside its buffer an access reads 0, as with the copies' table)
+            for (int k = 0; k < (size < 4 ? 1 : nw); k++)
+                if (d != RZ && d + k < RZ) { c->reg_used[d + k] = 1; sp(&c->body, "      r%d = 0u;\n", d + k); }
+        }
+        if (gk >= 0) sp(&c->body, "    } }\n");
     } else if (emit_half(c, w)) {
     } else if (OPM(0x50f8000000000000ull, 0xfff8000000000000ull)) {  // FSWZADD
         // per quad lane (laneid & 3), 2 bits of the swizzle pick: a+b, b-a, a-b, b
@@ -2089,6 +2133,10 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
     }
     if (info->npush) sp(&s, "layout(push_constant) uniform PC { layout(offset = %u) uint pcw[%d]; };\n", info->push_base, info->npush);  // (push_promote)
+    for (int k = 0; k < 16; k++)  // (maxwell_gmem_ssbo: gss_load) the storage slots read as their own buffers
+        if (c->gss_used & (1u << k))
+            sp(&s, "layout(std430, set = %d, binding = %d) readonly buffer GS%d { uint w[]; } gs%d_;\n", set, GSS_BINDING + k, k, k);
+    info->gss_mask = c->gss_used;
     if (info->uses_gmem && !maxwell_gmem_chunk_shift) {
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
@@ -2845,6 +2893,568 @@ static Ast *ast_build(Ctx *c, SBlock *b, int nb) {
     return a;
 }
 
+// ------------------------------------------------------------------ global memory address sources (GLSL)
+// LARECOMP_VK_GMEM_SSBO (maxwell_gmem_ssbo): which LDG reads a storage buffer the game bound - its address is the slot's
+// descriptor (driver constants c0[0x110 + 16 * slot] vertex, c0[0x510 + 16 * slot] fragment) plus an offset - so it
+// can read that range as its own storage buffer instead of the whole heap (or, without a heap import, instead of the
+// copies' table lookup, gfind). The idea is Ryujinx's GlobalToStorage pass (Ryujinx.Graphics.Shader, MIT, Copyright (c)
+// Ryujinx Team and Contributors), the descriptor windows kirikae's (crates/maxwell/src/translate.rs storage_window,
+// MIT/Apache-2.0); written here as a forward dataflow over the program's blocks: each register is a constant, a
+// constant buffer word plus a constant, a word plus something unknown, or unknown; blocks join by meet. SYNC / BRK /
+// CONT go where the statically resolved stacks say (else to every SSY / PBK / PCNT target), a BRX to its jump table's
+// targets (else to every instruction). A guarded write is a join with the old value, except that the same guard reads
+// it back and the opposite guard (no predicate written between) completes it. Sound by construction for the
+// instructions modelled; every other one makes the registers it writes unknown.
+
+enum { GV_TOP, GV_BOT, GV_CONST, GV_CB, GV_CBD };  // CB: cb word + c; CBD: cb word + something unknown
+typedef struct { uint8_t k, cb; uint16_t off; int32_t c; } GV;
+
+enum { GT_A, GT_A_LO, GT_B, GT_C, GT_AU };  // a: storage descriptor (lo + hi); a_lo: only the low word traced; b: another
+// constant buffer word; c: anything else; au: (compute) a uniform buffer descriptor c0[0x210 + 16 * i] (slot 16 + i)
+typedef struct {
+    uint32_t pc;
+    uint8_t kind;   // 0 LDG 1 STG 2 ATOM 3 RED 4 LD 5 ST
+    uint8_t cls;    // GT_*
+    int8_t slot;    // (a) descriptor slot
+    bool dyn;       // (a) register offset (else constant: off_c)
+    int32_t off_c;
+    uint8_t cb; uint16_t cboff;  // (b) the word
+} GtAcc;
+
+typedef struct {
+    GtAcc *acc; int nacc;
+    bool brx, size_read;  // (brx: a BRX without a known table: every instruction a target)
+    int brx_tab;          // BRX with their jump tables read
+    bool stacks;          // the SYNC / BRK / CONT targets resolved (else every pop goes to every push target)
+    int nblocks;
+} GtResult;
+
+static inline uint64_t gt_bits(uint64_t w, int lo, int n) { return (w >> lo) & ((1ull << n) - 1); }
+static inline int64_t gt_sbits(uint64_t w, int lo, int n) {
+    int64_t v = (int64_t)gt_bits(w, lo, n);
+    return (v & (1ll << (n - 1))) ? v - (1ll << n) : v;
+}
+#define GT_M(v, m) ((w & (uint64_t)(m)) == (uint64_t)(v))
+
+static inline GV gv_bot(void) { GV v = {GV_BOT, 0, 0, 0}; return v; }
+static inline GV gv_const(int32_t c) { GV v = {GV_CONST, 0, 0, c}; return v; }
+static inline GV gv_cb(int cb, int off) { GV v = {GV_CB, (uint8_t)cb, (uint16_t)off, 0}; return v; }
+static inline bool gv_is_cb(GV v) { return v.k == GV_CB || v.k == GV_CBD; }
+static inline bool gv_eq(GV a, GV b) { return a.k == b.k && a.cb == b.cb && a.off == b.off && a.c == b.c; }
+static inline GV gv_join(GV a, GV b) {
+    if (a.k == GV_TOP) return b;
+    if (b.k == GV_TOP) return a;
+    if (gv_eq(a, b)) return a;
+    if (gv_is_cb(a) && gv_is_cb(b) && a.cb == b.cb && a.off == b.off) { GV r = a; r.k = GV_CBD; r.c = 0; return r; }
+    return gv_bot();
+}
+// a + b (+ carry: x)
+static inline GV gv_add(GV a, GV b, bool x) {
+    if (a.k == GV_TOP || b.k == GV_TOP) return gv_bot();
+    if (gv_is_cb(a) && gv_is_cb(b)) return gv_bot();
+    if (gv_is_cb(b)) { GV t = a; a = b; b = t; }
+    if (gv_is_cb(a)) {
+        if (b.k == GV_CONST && a.k == GV_CB && !x) { a.c += b.c; return a; }
+        a.k = GV_CBD; a.c = 0; return a;
+    }
+    if (a.k == GV_CONST && b.k == GV_CONST && !x) return gv_const(a.c + b.c);
+    return gv_bot();
+}
+static inline GV gv_neg(GV a, bool n) {
+    if (!n) return a;
+    if (a.k == GV_CONST) return gv_const(-a.c);
+    return gv_bot();
+}
+static inline GV gv_shl(GV a, int s) {
+    if (s == 0) return a;
+    if (a.k == GV_CONST) return gv_const((int32_t)((uint32_t)a.c << s));
+    return gv_bot();
+}
+
+// Operand B of the reg / cbuf / imm ALU forms (0x5 / 0x4 / 0x3 classes)
+static inline GV gt_opb(const GV *r, uint64_t w) {
+    uint64_t top = w >> 60;
+    if (top == 5) { int b = (int)gt_bits(w, 20, 8); return b == 255 ? gv_const(0) : r[b]; }
+    if (top == 4) return gv_cb((int)gt_bits(w, 34, 5), (int)gt_bits(w, 20, 14) * 4);
+    uint32_t v = (uint32_t)gt_bits(w, 20, 19) | ((uint32_t)gt_bits(w, 56, 1) << 19);
+    if (v & 0x80000u) v |= 0xFFF00000u;
+    return gv_const((int32_t)v);
+}
+static inline GV gt_reg(const GV *r, int i) { return i == 255 ? gv_const(0) : r[i]; }
+
+static inline bool gt_is_flow(uint64_t w) {
+    uint64_t t = w & 0xfff0000000000000ull;
+    return t == 0xe240000000000000ull || t == 0xe300000000000000ull || t == 0xe340000000000000ull ||
+           t == 0xe350000000000000ull || t == 0xe250000000000000ull || t == 0xe320000000000000ull ||
+           t == 0xe260000000000000ull || t == 0xe220000000000000ull || (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull;
+}
+
+// The access an instruction makes, -1 none (kind as GtAcc.kind); *a: address register, *wide: 64-bit address
+static inline int gt_access(uint64_t w, int *a, bool *wide) {
+    *a = (int)gt_bits(w, 8, 8);
+    if (GT_M(0xeed0000000000000ull, 0xfff8000000000000ull)) { *wide = gt_bits(w, 45, 1); return 0; }
+    if (GT_M(0xeed8000000000000ull, 0xfff8000000000000ull)) { *wide = gt_bits(w, 45, 1); return 1; }
+    if (GT_M(0xeef0000000000000ull, 0xfff0000000000000ull)) { *wide = gt_bits(w, 49, 1); return 2; }  // ATOM.CAS
+    if (GT_M(0xed00000000000000ull, 0xff00000000000000ull)) { *wide = gt_bits(w, 48, 1); return 2; }  // ATOM
+    if (GT_M(0xebf8000000000000ull, 0xfff8000000000000ull)) { *wide = gt_bits(w, 48, 1); return 3; }  // RED
+    if (GT_M(0x8000000000000000ull, 0xe000000000000000ull)) { *wide = gt_bits(w, 45, 1); return 4; }  // LD (generic)
+    if (GT_M(0xa000000000000000ull, 0xe000000000000000ull)) { *wide = gt_bits(w, 45, 1); return 5; }  // ST (generic)
+    return -1;
+}
+
+// Registers an instruction writes that the transfer below doesn't model: [d, d + n) and (texture pairs) [d2, d2 + n2)
+static inline void gt_kill_set(uint64_t w, int *d, int *n, int *d2, int *n2) {
+    *d = (int)gt_bits(w, 0, 8); *n = 1; *d2 = 255; *n2 = 0;
+    uint64_t t12 = w & 0xfff0000000000000ull, t13 = w & 0xfff8000000000000ull;
+    // no register written: control, stores, predicate writers, barriers
+    if ((w >> 56) == 0xe2 || (w >> 56) == 0xe3 || t13 == 0xf0f8000000000000ull || t13 == 0xf0f0000000000000ull ||
+        t13 == 0xf0a8000000000000ull || t13 == 0x50b0000000000000ull || t13 == 0xef98000000000000ull ||
+        t13 == 0xeed8000000000000ull || GT_M(0xa000000000000000ull, 0xe000000000000000ull) || t13 == 0xef50000000000000ull ||
+        t13 == 0xef58000000000000ull || t13 == 0xebf8000000000000ull || t13 == 0xeff0000000000000ull ||
+        (w & 0xfff0000000000000ull) == 0xeb20000000000000ull ||
+        t12 == 0x5bb0000000000000ull || t12 == 0x4bb0000000000000ull || (w & 0xfef0000000000000ull) == 0x36b0000000000000ull ||
+        t12 == 0x5b60000000000000ull || t12 == 0x4b60000000000000ull || (w & 0xfef0000000000000ull) == 0x3660000000000000ull ||
+        t13 == 0x5090000000000000ull || t13 == 0x50a0000000000000ull || t12 == 0x5b80000000000000ull ||
+        t12 == 0x4b80000000000000ull || (w & 0xfef0000000000000ull) == 0x3680000000000000ull ||
+        t13 == 0x5cf0000000000000ull || t13 == 0x4cf0000000000000ull || (w & 0xfef8000000000000ull) == 0x38f0000000000000ull) {
+        *n = 0; return;
+    }
+    int sz = (int)gt_bits(w, 48, 3);
+    int nw = sz == 5 ? 2 : sz >= 6 ? 4 : 1;
+    if (t13 == 0xeed0000000000000ull || t13 == 0xef40000000000000ull || t13 == 0xef48000000000000ull ||
+        GT_M(0x8000000000000000ull, 0xe000000000000000ull)) { *n = nw; return; }
+    if (t13 == 0xefd8000000000000ull) { *n = 1 + (int)gt_bits(w, 47, 2); return; }  // ALD
+    if (GT_M(0xd000000000000000ull, 0xf600000000000000ull) || GT_M(0xd200000000000000ull, 0xf600000000000000ull)) {
+        // TEXS / TLDS: the components (mask by bits 50-52, LA translate.c emit_texs) into d0, d0 + 1, d1, d1 + 1;
+        // .F16 (bit 59 clear) packs them in pairs into d0 and d1
+        int d1 = (int)gt_bits(w, 28, 8), msel = (int)gt_bits(w, 50, 3);
+        static const uint8_t m2[] = {1, 2, 4, 8, 3, 9, 10, 12}, m4[] = {7, 11, 13, 14, 15, 15, 15, 15};
+        int nc = __builtin_popcount(d1 == 255 ? m2[msel] : m4[msel]);
+        if (!gt_bits(w, 59, 1)) { *n = 1; *d2 = nc > 2 ? d1 : 255; *n2 = nc > 2; }
+        else { *n = nc < 2 ? nc : 2; *d2 = d1; *n2 = nc > 2 ? nc - 2 : 0; }
+        if (*d == 255) *n = 0;
+        if (*d2 == 255) *n2 = 0;
+        return;
+    }
+    if (GT_M(0xc038000000000000ull, 0xfc38000000000000ull) || GT_M(0xdeb8000000000000ull, 0xfff8000000000000ull)) {
+        *n = __builtin_popcount((unsigned)gt_bits(w, 31, 4)); return;  // TEX: the mask's components from d
+    }
+    if ((w >> 60) == 0xc || (w >> 60) == 0xd) {  // other texture / surface ops: up to 4 + a second pair
+        *n = 4; *d2 = (int)gt_bits(w, 28, 8); *n2 = 2; return;
+    }
+    if (GT_M(0xed00000000000000ull, 0xff00000000000000ull) || GT_M(0xeef0000000000000ull, 0xfff0000000000000ull)) { *n = 2; return; }
+    // doubles: DADD DMUL DFMA DMNMX (any form) write a pair
+    uint64_t o = w & 0x0ff8000000000000ull;  // (the opcode without its form nibble)
+    if (((w >> 60) >= 3 && (w >> 60) <= 5) && (o == 0x0c70000000000000ull || o == 0x0c80000000000000ull ||
+                                              o == 0x0c50000000000000ull || (w & 0x0ff0000000000000ull) == 0x0b70000000000000ull)) { *n = 2; return; }
+}
+
+// The register state inside a block: values, plus (predication) each register's last write under a guard when no
+// predicate can have changed since (ep): an instruction under the same guard reads that value, a write under the
+// opposite guard completes it (both cases covered: the older value is gone). Reset at block starts.
+typedef struct { int8_t p; bool n; uint32_t ep; GV v; } GtGuard;
+typedef struct { GV r[256]; GtGuard g[256]; uint32_t ep; int gp; bool gn; } GtCtx;
+
+// Instructions known not to write a predicate (everything else ends the guard records)
+static inline bool gt_no_pred_write(uint64_t w) {
+    uint64_t t13 = w & 0xfff8000000000000ull, t = w >> 60;
+    if (t == 0xc || t == 0xd) return true;  // texture fetches (no .P forms here)
+    if ((t == 3 || t == 4 || t == 5) && ((w & 0x0ff8000000000000ull) == 0x0c98000000000000ull ||  // MOV
+        (w & 0x0ff8000000000000ull) == 0x0c10000000000000ull || (w & 0x0ff0000000000000ull) == 0x0cc0000000000000ull ||  // IADD IADD3
+        (w & 0x0ff8000000000000ull) == 0x0c18000000000000ull || (w & 0x0ff8000000000000ull) == 0x0ca0000000000000ull ||  // ISCADD SEL
+        (w & 0x0ff8000000000000ull) == 0x0c48000000000000ull || (w & 0x0ff8000000000000ull) == 0x0c28000000000000ull ||  // SHL SHR
+        (w & 0x0ff8000000000000ull) == 0x0c58000000000000ull || (w & 0x0ff8000000000000ull) == 0x0c68000000000000ull ||  // FADD FMUL
+        (w & 0x0ff8000000000000ull) == 0x0cb0000000000000ull || (w & 0x0ff8000000000000ull) == 0x0cb8000000000000ull ||  // F2I I2F
+        (w & 0x0ff8000000000000ull) == 0x0ca8000000000000ull || (w & 0x0ff8000000000000ull) == 0x0ce0000000000000ull ||  // F2F I2I
+        (w & 0x0ff8000000000000ull) == 0x0c00000000000000ull || (w & 0x0ff8000000000000ull) == 0x0c38000000000000ull ||  // BFE IMUL
+        (w & 0x0ff8000000000000ull) == 0x0c08000000000000ull || (w & 0x0ff8000000000000ull) == 0x0c30000000000000ull ||  // POPC FLO
+        (w & 0x0ff8000000000000ull) == 0x0c60000000000000ull || (w & 0x0ff8000000000000ull) == 0x0c20000000000000ull ||  // FMNMX IMNMX
+        (w & 0x0ff8000000000000ull) == 0x0c90000000000000ull || (w & 0x0ff0000000000000ull) == 0x0bc0000000000000ull ||  // RRO PRMT
+        (w & 0x0ff8000000000000ull) == 0x0bf0000000000000ull)) return true;  // BFI
+    if ((w >> 56) == 0x59 || (w >> 56) == 0x49 || (w >> 56) == 0x51 || (w >> 56) == 0x32 || (w >> 56) == 0x33) return true;  // FFMA (+XMAD 0x51)
+    if ((w & 0xffc0000000000000ull) == 0x5b00000000000000ull || (w & 0xfe00000000000000ull) == 0x4e00000000000000ull ||
+        (w & 0xfec0000000000000ull) == 0x3600000000000000ull) return true;  // XMAD
+    if ((w >> 58) == (0x1c >> 2) || (w >> 58) == (0x14 >> 2) || (w >> 52) == 0x010 || (w >> 58) == (0x08 >> 2) ||
+        (w >> 56) == 0x1e || (w >> 58) == (0x0c >> 2) || (w >> 56) == 0x1f) return true;  // IADD32I ISCADD32I MOV32I FADD32I FMUL32I FFMA32I IMUL32I
+    if (t13 == 0xeed0000000000000ull || t13 == 0xeed8000000000000ull || t13 == 0xef90000000000000ull || t13 == 0xef40000000000000ull ||
+        t13 == 0xef50000000000000ull || t13 == 0xef48000000000000ull || t13 == 0xef58000000000000ull || t13 == 0xefd8000000000000ull ||
+        t13 == 0xeff0000000000000ull || t13 == 0x5080000000000000ull || t13 == 0xf0c8000000000000ull || t13 == 0xf0f0000000000000ull ||
+        t13 == 0x50b0000000000000ull || t13 == 0xef98000000000000ull || (w & 0xff00000000000000ull) == 0xe000000000000000ull)
+        return true;  // LDG STG LDC LDL STL LDS STS ALD AST MUFU S2R DEPBAR NOP MEMBAR IPA
+    if ((w >> 56) >= 0xe2 && (w >> 56) <= 0xe3) return true;  // flow (ends the block anyway)
+    return false;
+}
+
+static inline GV gx_get(const GtCtx *x, int i) {
+    if (i == 255) return gv_const(0);
+    if (x->gp >= 0 && x->g[i].p == x->gp && x->g[i].n == x->gn && x->g[i].ep == x->ep) return x->g[i].v;
+    return x->r[i];
+}
+static inline void gx_set(GtCtx *x, int i, GV v) {
+    if (i >= 255) return;
+    if (x->gp < 0) { x->r[i] = v; x->g[i].p = -1; return; }
+    GtGuard *g = &x->g[i];
+    if (g->p == x->gp && g->n != x->gn && g->ep == x->ep) { x->r[i] = gv_join(g->v, v); g->p = -1; return; }  // (complement)
+    x->r[i] = gv_join(x->r[i], v);
+    g->p = (int8_t)x->gp, g->n = x->gn, g->ep = x->ep, g->v = v;
+}
+static inline void gx_reset(GtCtx *x) { for (int i = 0; i < 256; i++) x->g[i].p = -1; x->ep = 0; x->gp = -1; }
+static inline void gx_guard(GtCtx *x, uint64_t w) {  // (before an instruction: its guard; P7 = always)
+    int pr = (int)gt_bits(w, 16, 3); bool prn = gt_bits(w, 19, 1);
+    uint64_t t12 = w & 0xfff0000000000000ull;
+    if (t12 == 0xe290000000000000ull || t12 == 0xe2a0000000000000ull || t12 == 0xe2b0000000000000ull) pr = 7, prn = false;
+    x->gp = pr == 7 ? -1 : pr; x->gn = prn;
+}
+// One instruction's effect on the register state
+static inline void gt_step(GtCtx *x, uint64_t w) {
+    int d = (int)gt_bits(w, 0, 8), a = (int)gt_bits(w, 8, 8);
+    int pr = (int)gt_bits(w, 16, 3); bool prn = gt_bits(w, 19, 1);
+    uint64_t t12 = w & 0xfff0000000000000ull;
+    if (t12 == 0xe290000000000000ull || t12 == 0xe2a0000000000000ull || t12 == 0xe2b0000000000000ull) return;
+    if (pr == 7 && prn) return;  // never runs
+    gx_guard(x, w);
+    GV r[256];  // (the operands as this instruction's guard sees them: only the ones read)
+    r[a] = gx_get(x, a);
+    { int b = (int)gt_bits(w, 20, 8), cc = (int)gt_bits(w, 39, 8); r[b] = gx_get(x, b); r[cc] = gx_get(x, cc); }
+    GV res[4]; int nres = 0, dst = d;
+    bool known = true;
+    if (GT_M(0x5c98000000000000ull, 0xfff8000000000000ull) || GT_M(0x4c98000000000000ull, 0xfff8000000000000ull) ||
+        GT_M(0x3898000000000000ull, 0xfef8000000000000ull)) {  // MOV
+        res[0] = gt_opb(r, w); nres = 1;
+    } else if (GT_M(0x0100000000000000ull, 0xfff0000000000000ull)) {  // MOV32I
+        res[0] = gv_const((int32_t)gt_bits(w, 20, 32)); nres = 1;
+    } else if (GT_M(0x5c10000000000000ull, 0xfff8000000000000ull) || GT_M(0x4c10000000000000ull, 0xfff8000000000000ull) ||
+               GT_M(0x3810000000000000ull, 0xfef8000000000000ull)) {  // IADD (neg a 49, neg b 48, X 43)
+        res[0] = gv_add(gv_neg(gt_reg(r, a), gt_bits(w, 49, 1)), gv_neg(gt_opb(r, w), gt_bits(w, 48, 1)), gt_bits(w, 43, 1)); nres = 1;
+    } else if (GT_M(0x1c00000000000000ull, 0xfe00000000000000ull)) {  // IADD32I (neg a 56, X 53)
+        res[0] = gv_add(gv_neg(gt_reg(r, a), gt_bits(w, 56, 1)), gv_const((int32_t)gt_bits(w, 20, 32)), gt_bits(w, 53, 1)); nres = 1;
+    } else if (GT_M(0x5cc0000000000000ull, 0xfff0000000000000ull) || GT_M(0x4cc0000000000000ull, 0xfff0000000000000ull) ||
+               GT_M(0x38c0000000000000ull, 0xfef0000000000000ull)) {  // IADD3 (neg 51 / 50 / 49, X 48; reg form shifts 37-38)
+        if ((w >> 60) == 5 && gt_bits(w, 37, 2)) res[0] = gv_bot();
+        else {
+            GV s = gv_add(gv_neg(gt_reg(r, a), gt_bits(w, 51, 1)), gv_neg(gt_opb(r, w), gt_bits(w, 50, 1)), false);
+            res[0] = gv_add(s, gv_neg(gt_reg(r, (int)gt_bits(w, 39, 8)), gt_bits(w, 49, 1)), gt_bits(w, 48, 1));
+        }
+        nres = 1;
+    } else if (GT_M(0x5c18000000000000ull, 0xfff8000000000000ull) || GT_M(0x4c18000000000000ull, 0xfff8000000000000ull) ||
+               GT_M(0x3818000000000000ull, 0xfef8000000000000ull)) {  // ISCADD (a << s) + b
+        res[0] = gv_add(gv_shl(gv_neg(gt_reg(r, a), gt_bits(w, 49, 1)), (int)gt_bits(w, 39, 5)), gv_neg(gt_opb(r, w), gt_bits(w, 48, 1)), false);
+        nres = 1;
+    } else if (GT_M(0x1400000000000000ull, 0xfc00000000000000ull)) {  // ISCADD32I
+        res[0] = gv_add(gv_shl(gt_reg(r, a), (int)gt_bits(w, 53, 5)), gv_const((int32_t)gt_bits(w, 20, 32)), false); nres = 1;
+    } else if (GT_M(0x5bd0000000000000ull, 0xfff8000000000000ull) || GT_M(0x4bd0000000000000ull, 0xfff8000000000000ull) ||
+               GT_M(0x36d0000000000000ull, 0xfef8000000000000ull)) {  // LEA (a << s) + b, s bits 39-43, neg a 45, X 46
+        res[0] = gv_add(gv_shl(gv_neg(gt_reg(r, a), gt_bits(w, 45, 1)), (int)gt_bits(w, 39, 5)), gt_opb(r, w), gt_bits(w, 46, 1)); nres = 1;
+    } else if (GT_M(0x5bd8000000000000ull, 0xfff8000000000000ull) || GT_M(0x1800000000000000ull, 0xfc00000000000000ull)) {  // LEA.HI
+        GV b = (w >> 60) == 5 ? gt_reg(r, (int)gt_bits(w, 20, 8)) : gv_cb((int)gt_bits(w, 34, 5), (int)gt_bits(w, 20, 14) * 4);
+        res[0] = gv_is_cb(b) ? (GV){GV_CBD, b.cb, b.off, 0} : gv_bot(); nres = 1;
+    } else if (GT_M(0x5ca0000000000000ull, 0xfff8000000000000ull) || GT_M(0x4ca0000000000000ull, 0xfff8000000000000ull) ||
+               GT_M(0x38a0000000000000ull, 0xfef8000000000000ull)) {  // SEL
+        res[0] = gv_join(gt_reg(r, a), gt_opb(r, w)); nres = 1;
+    } else if (GT_M(0x5b00000000000000ull, 0xffc0000000000000ull) || GT_M(0x4e00000000000000ull, 0xfe00000000000000ull) ||
+               GT_M(0x3600000000000000ull, 0xfec0000000000000ull) || GT_M(0x5100000000000000ull, 0xff80000000000000ull)) {  // XMAD
+        // d = a * b + c: a base in c with a plain mode keeps its word (offset unknown)
+        GV cv = (w >> 56) == 0x51 ? gv_cb((int)gt_bits(w, 34, 5), (int)gt_bits(w, 20, 14) * 4) : gt_reg(r, (int)gt_bits(w, 39, 8));
+        int mode = (w >> 56) == 0x5b || (w >> 56) == 0x36 || (w >> 56) == 0x37 ? (int)gt_bits(w, 50, 3) : (int)gt_bits(w, 50, 2);
+        bool psl_mrg = ((w >> 56) == 0x5b || (w >> 56) == 0x36 || (w >> 56) == 0x37) && gt_bits(w, 36, 2);
+        res[0] = gv_is_cb(cv) && mode == 0 && !psl_mrg ? (GV){GV_CBD, cv.cb, cv.off, 0} : gv_bot(); nres = 1;
+    } else if (GT_M(0x5c48000000000000ull, 0xfff8000000000000ull) || GT_M(0x4c48000000000000ull, 0xfff8000000000000ull) ||
+               GT_M(0x3848000000000000ull, 0xfef8000000000000ull)) {  // SHL
+        GV b = gt_opb(r, w), av = gt_reg(r, a);
+        res[0] = b.k == GV_CONST && av.k == GV_CONST ? gv_const((int32_t)((uint32_t)av.c << (b.c & 31))) : gv_bot(); nres = 1;
+    } else if (GT_M(0xef90000000000000ull, 0xfff8000000000000ull)) {  // LDC c[idx][reg + imm]
+        int idx = (int)gt_bits(w, 36, 5), sz = (int)gt_bits(w, 48, 3);
+        int64_t off = (int64_t)gt_bits(w, 20, 16);
+        GV av = gt_reg(r, a);
+        int n = sz == 5 ? 2 : 1;
+        for (int i = 0; i < n; i++)
+            res[i] = av.k == GV_CONST ? gv_cb(idx, (int)(off + av.c + 4 * i)) : gv_bot();
+        nres = n;
+    } else known = false;
+    if (!known) {
+        int kd, kn, kd2, kn2;
+        gt_kill_set(w, &kd, &kn, &kd2, &kn2);
+        for (int i = 0; i < kn; i++) if (kd + i < 255) x->r[kd + i] = gv_bot(), x->g[kd + i].p = -1;
+        for (int i = 0; i < kn2; i++) if (kd2 + i < 255) x->r[kd2 + i] = gv_bot(), x->g[kd2 + i].p = -1;
+    } else for (int i = 0; i < nres; i++) gx_set(x, dst + i, res[i]);
+    if (!gt_no_pred_write(w)) x->ep++;
+}
+
+// Does this instruction read c0[off] with off in the stage's window at +8 (the size)? (statically addressed forms)
+static inline bool gt_reads_size(uint64_t w, uint32_t base) {
+    int cb = -1, off = 0;
+    if ((w >> 60) == 4 || (w >> 56) == 0x51 || (w >> 56) == 0x53) cb = (int)gt_bits(w, 34, 5), off = (int)gt_bits(w, 20, 14) * 4;
+    else if (GT_M(0xef90000000000000ull, 0xfff8000000000000ull) && gt_bits(w, 8, 8) == 255) cb = (int)gt_bits(w, 36, 5), off = (int)gt_bits(w, 20, 16);
+    return cb == 0 && off >= (int)base && off < (int)base + 256 && (off & 15) == 8;
+}
+
+// A BRX's jump table (LA translate.c brx_table_labels' rule): ra set by an LDC from c1 a few instructions before,
+// nothing else writing it; the table's entries (relative to the BRX) in the shader's constants. Targets into t[], count.
+static int gt_brx_targets(const uint64_t *code, size_t i, size_t end, const uint8_t *cdata, size_t clen, uint32_t *t) {
+    if (!cdata) return -1;
+    uint64_t brx = code[i];
+    int ra = (int)gt_bits(brx, 8, 8);
+    int64_t imm = gt_sbits(brx, 20, 24), table = -1;
+    if (ra == 255) return -1;
+    for (size_t k = i, seen = 0; k-- > 0 && seen < 256;) {
+        if (k % 4 == 0) continue;
+        seen++;
+        uint64_t w = code[k];
+        if ((w & 0xfff0000000000000ull) >= 0xe200000000000000ull && (w & 0xfff0000000000000ull) <= 0xe350000000000000ull) return -1;
+        if ((w & 0xfff8000000000000ull) == 0xef90000000000000ull && (int)gt_bits(w, 0, 8) == ra) {
+            if (gt_bits(w, 36, 5) != 1 || gt_bits(w, 48, 3) != 4) return -1;
+            table = (int64_t)gt_bits(w, 20, 16);
+            break;
+        }
+        if ((int)gt_bits(w, 0, 8) == ra) return -1;
+    }
+    if (table < 0) return -1;
+    int n = 0;
+    for (int k = 0; k < 256 && (size_t)table + 4 * k + 4 <= clen; k++) {
+        int32_t v; memcpy(&v, cdata + table + 4 * k, 4);
+        int64_t x = (int64_t)i * 8 + 8 + v + imm;
+        if (x < 8 || (x & 7) || (size_t)(x / 8) >= end) break;
+        if (((x / 8) % 4) == 0) x += 8;
+        if ((size_t)(x / 8) >= end) break;
+        t[n++] = (uint32_t)(x / 8);
+    }
+    return n > 0 ? n : -1;
+}
+
+// SYNC / BRK / CONT targets resolved statically (as LA translate.c static_stacks_resolve: each label's SSY / PBK / PCNT
+// stack contents must agree on every path), BRX with known tables followed. pop[i]: the target word of the pop at i.
+typedef struct { uint8_t n[3]; uint32_t v[3][16]; } GtStk;
+static bool gt_stacks(const uint64_t *code, size_t end, const uint8_t *label, const int *brxn, const uint32_t *brxt, uint32_t *pop) {
+    GtStk *at = calloc(end + 1, sizeof *at);
+    uint8_t *seen = calloc(end + 1, 1);
+    size_t *work = malloc((end + 1) * sizeof *work), nwork = 0;
+    bool ok = true;
+#define GT_ENQ(idx, st) do { size_t e_ = (idx); \
+        if (e_ >= end || !label[e_]) { ok = false; break; } \
+        if (seen[e_]) { if (memcmp(&at[e_], (st), sizeof(GtStk))) ok = false; break; } \
+        seen[e_] = 1; at[e_] = *(st); work[nwork++] = e_; } while (0)
+    GtStk s0; memset(&s0, 0, sizeof s0);
+    GT_ENQ(1, &s0);
+    while (ok && nwork) {
+        size_t i = work[--nwork];
+        GtStk s = at[i];
+        for (bool first = true; ok; first = false, i++) {
+            if (i % 4 == 0) continue;
+            if (i >= end) break;
+            if (!first && label[i]) { GT_ENQ(i, &s); break; }
+            uint64_t w = code[i], t12 = w & 0xfff0000000000000ull;
+            int pr = (int)gt_bits(w, 16, 3); bool prn = gt_bits(w, 19, 1);
+            int64_t tt = (int64_t)i * 8 + 8 + gt_sbits(w, 20, 24);
+            if (tt >= 0 && ((tt / 8) % 4) == 0) tt += 8;
+            int k = t12 == 0xe290000000000000ull ? 0 : t12 == 0xe2a0000000000000ull ? 1 : t12 == 0xe2b0000000000000ull ? 2 : -1;
+            if (k >= 0) {
+                if ((w & 0x20) || s.n[k] >= 16 || tt < 0) { ok = false; break; }
+                s.v[k][s.n[k]++] = (uint32_t)(tt / 8);
+                continue;
+            }
+            if (pr == 7 && prn) continue;
+            bool guarded = !(pr == 7 && !prn);
+            if (t12 == 0xe250000000000000ull && brxn[i]) {
+                for (int j = 0; j < brxn[i] && ok; j++) GT_ENQ(brxt[i * 256 + j], &s);
+                if (!guarded) break;
+                continue;
+            }
+            if (t12 == 0xe200000000000000ull || t12 == 0xe210000000000000ull || t12 == 0xe250000000000000ull ||
+                t12 == 0xe260000000000000ull || t12 == 0xe270000000000000ull || t12 == 0xe280000000000000ull ||
+                t12 == 0xe310000000000000ull || t12 == 0xe320000000000000ull || t12 == 0xe220000000000000ull) { ok = false; break; }
+            if ((w & 0xfff0000000000020ull) == 0xe240000000000000ull) {
+                if (tt < 0) { ok = false; break; }
+                GT_ENQ((size_t)(tt / 8), &s);
+                if (!guarded && gt_bits(w, 0, 5) == 0xF) break;
+                continue;
+            }
+            if (t12 == 0xe300000000000000ull) { if (!guarded) break; continue; }
+            int pk = (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull ? 0 : t12 == 0xe340000000000000ull ? 1 :
+                     t12 == 0xe350000000000000ull ? 2 : -1;
+            if (pk >= 0) {
+                if (!s.n[pk]) { ok = false; break; }
+                uint32_t tgt = s.v[pk][s.n[pk] - 1];
+                if (pop[i] && pop[i] != tgt) { ok = false; break; }
+                pop[i] = tgt;
+                GtStk t = s;
+                if (pk != 2) t.v[pk][--t.n[pk]] = 0;
+                GT_ENQ(tgt, &t);
+                if (!guarded) break;
+                continue;
+            }
+        }
+    }
+#undef GT_ENQ
+    free(at); free(seen); free(work);
+    return ok;
+}
+
+// code: the first instruction group (scheduling word at index 0); end: words. base: the stage's descriptor window;
+// cdata / clen: the shader's constants (c1: BRX jump tables), NULL if unknown
+static GtResult gt_analyze(const uint64_t *code, size_t end, uint32_t base, const uint8_t *cdata, size_t clen) {
+    GtResult R = {0};
+    uint8_t *lead = calloc(end + 2, 1);
+    bool any_brx = false;
+    int nssy = 0, npbk = 0, npcnt = 0;
+    uint32_t *ssy = calloc(end + 1, 4), *pbk = calloc(end + 1, 4), *pcnt = calloc(end + 1, 4);
+    if (end > 1) lead[1] = 1;
+    uint32_t *brxt = NULL; int *brxn = calloc(end + 1, sizeof(int));  // (per BRX: its table's targets at brxt + i * 256)
+    for (size_t i = 0; i < end; i++) {
+        if (i % 4 == 0) continue;
+        uint64_t w = code[i];
+        uint64_t t12 = w & 0xfff0000000000000ull;
+        int64_t t = (int64_t)i * 8 + 8 + gt_sbits(w, 20, 24);
+        if (t >= 0 && ((t / 8) % 4) == 0) t += 8;
+        bool rel = t12 == 0xe240000000000000ull || t12 == 0xe290000000000000ull || t12 == 0xe2a0000000000000ull ||
+                   t12 == 0xe2b0000000000000ull || t12 == 0xe260000000000000ull;
+        if (rel && !(w & 0x20) && t >= 0 && (size_t)(t / 8) < end) {
+            lead[t / 8] = 1;
+            if (t12 == 0xe290000000000000ull) ssy[nssy++] = (uint32_t)(t / 8);
+            if (t12 == 0xe2a0000000000000ull) pbk[npbk++] = (uint32_t)(t / 8);
+            if (t12 == 0xe2b0000000000000ull) pcnt[npcnt++] = (uint32_t)(t / 8);
+        }
+        if (t12 == 0xe250000000000000ull) {
+            uint32_t tt[256];
+            int nt = gt_brx_targets(code, i, end, cdata, clen, tt);
+            if (nt < 0) any_brx = true;
+            else {
+                brxn[i] = nt;
+                brxt = realloc(brxt, (i + 1) * 256 * 4);  // (sparse: sized to the last BRX)
+                memcpy(brxt + i * 256, tt, (size_t)nt * 4);
+                for (int k = 0; k < nt; k++) lead[tt[k]] = 1;
+                R.brx_tab++;
+            }
+        }
+        if (t12 == 0xe220000000000000ull || t12 == 0xe320000000000000ull) any_brx = true;
+        if (gt_is_flow(w) || t12 == 0xe260000000000000ull) { size_t n = i + 1; if (n % 4 == 0) n++; if (n < end) lead[n] = 1; }
+        if (gt_reads_size(w, base)) R.size_read = true;
+    }
+    R.brx = any_brx;
+    if (any_brx) for (size_t i = 0; i < end; i++) if (i % 4) lead[i] = 1;
+    uint32_t *pop = calloc(end + 1, 4);
+    if (!brxt) brxt = calloc(1, 4);
+    R.stacks = !any_brx && gt_stacks(code, end, lead, brxn, brxt, pop);
+    // blocks
+    int *blk_of = calloc(end + 1, sizeof(int)), nb = 0;
+    uint32_t *bfirst = calloc(end + 1, 4);
+    for (size_t i = 0; i < end; i++) {
+        if (i % 4 == 0) { blk_of[i] = nb - 1; continue; }
+        if (lead[i] || nb == 0) bfirst[nb++] = (uint32_t)i;
+        blk_of[i] = nb - 1;
+    }
+    R.nblocks = nb;
+    uint32_t *blast = calloc(nb + 1, 4);
+    for (int b = 0; b < nb; b++) {
+        size_t e = b + 1 < nb ? bfirst[b + 1] : end;
+        size_t l = e - 1; while (l % 4 == 0) l--;
+        blast[b] = (uint32_t)l;
+    }
+    GV *in = malloc((size_t)nb * 256 * sizeof(GV));
+    for (size_t i = 0; i < (size_t)nb * 256; i++) in[i] = (GV){GV_TOP, 0, 0, 0};
+    if (nb) for (int k = 0; k < 256; k++) in[k] = gv_bot();
+    uint8_t *inq = calloc(nb + 1, 1);
+    int *q = malloc(sizeof(int) * (nb + 1)), qh = 0, qt = 0;
+    if (nb) { q[qt++] = 0; inq[0] = 1; }
+    GtCtx *X = malloc(sizeof *X);
+    GV *st = X->r;
+    int *succ = malloc(sizeof(int) * (size_t)(nb + 4 + end + 256));
+    while (qh != qt) {
+        int b = q[qh]; qh = (qh + 1) % (nb + 1); inq[b] = 0;
+        memcpy(st, in + (size_t)b * 256, 256 * sizeof(GV)); gx_reset(X);
+        for (size_t i = bfirst[b]; i <= blast[b]; i++) { if (i % 4) gt_step(X, code[i]); }
+        uint64_t w = code[blast[b]];
+        uint64_t t12 = w & 0xfff0000000000000ull;
+        int pr = (int)gt_bits(w, 16, 3); bool prn = gt_bits(w, 19, 1);
+        bool uncond = pr == 7 && !prn;
+        int ns = 0;
+        bool fall = true;
+        int64_t t = (int64_t)blast[b] * 8 + 8 + gt_sbits(w, 20, 24);
+        if (t >= 0 && ((t / 8) % 4) == 0) t += 8;
+        if (t12 == 0xe240000000000000ull || t12 == 0xe260000000000000ull) {
+            if (t >= 0 && (size_t)(t / 8) < end && !(w & 0x20)) succ[ns++] = blk_of[t / 8];
+            if (t12 == 0xe240000000000000ull && uncond && gt_bits(w, 0, 5) == 0xF) fall = false;
+        } else if (t12 == 0xe300000000000000ull) fall = !uncond;
+        else if (R.stacks && ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull || t12 == 0xe340000000000000ull ||
+                              t12 == 0xe350000000000000ull)) {
+            if (pop[blast[b]]) succ[ns++] = blk_of[pop[blast[b]]];  // (0: the pop never runs - unreached)
+            fall = !uncond;
+        } else if ((w & 0xfff8000000000000ull) == 0xf0f8000000000000ull) { for (int k = 0; k < nssy; k++) succ[ns++] = blk_of[ssy[k]]; fall = !uncond; }
+        else if (t12 == 0xe340000000000000ull) { for (int k = 0; k < npbk; k++) succ[ns++] = blk_of[pbk[k]]; fall = !uncond; }
+        else if (t12 == 0xe350000000000000ull) { for (int k = 0; k < npcnt; k++) succ[ns++] = blk_of[pcnt[k]]; fall = !uncond; }
+        else if (t12 == 0xe250000000000000ull && brxn[blast[b]]) {
+            for (int k = 0; k < brxn[blast[b]]; k++) succ[ns++] = blk_of[brxt[blast[b] * 256 + k]];
+            fall = !uncond;
+        } else if (t12 == 0xe250000000000000ull || t12 == 0xe220000000000000ull || t12 == 0xe320000000000000ull) {
+            for (int k = 0; k < nb; k++) succ[ns++] = k;
+        }
+        if (fall && b + 1 < nb) succ[ns++] = b + 1;
+        for (int j = 0; j < ns; j++) {
+            int s = succ[j];
+            GV *si = in + (size_t)s * 256;
+            bool ch = false;
+            for (int k = 0; k < 255; k++) { GV n = gv_join(si[k], st[k]); if (!gv_eq(n, si[k])) { si[k] = n; ch = true; } }
+            if (ch && !inq[s]) { inq[s] = 1; q[qt] = s; qt = (qt + 1) % (nb + 1); }
+        }
+    }
+    // classify
+    int cap = 64;
+    R.acc = malloc(sizeof(GtAcc) * cap);
+    for (int b = 0; b < nb; b++) {
+        if (in[(size_t)b * 256].k == GV_TOP && b) continue;  // unreachable
+        memcpy(st, in + (size_t)b * 256, 256 * sizeof(GV)); gx_reset(X);
+        for (size_t i = bfirst[b]; i <= blast[b]; i++) {
+            if (i % 4 == 0) continue;
+            uint64_t w = code[i];
+            int ar; bool wide;
+            int kind = gt_access(w, &ar, &wide);
+            if (kind >= 0 && !(gt_bits(w, 16, 3) == 7 && gt_bits(w, 19, 1))) {
+                GtAcc x = {(uint32_t)i * 8, (uint8_t)kind, GT_C, -1, false, 0, 0, 0};
+                gx_guard(X, w);
+                GV lo = gx_get(X, ar), hi = wide ? gx_get(X, ar + 1) : gv_const(0);
+                if (gv_is_cb(lo)) {
+                    bool win = lo.cb == 0 && lo.off >= base && lo.off < base + 256 && (lo.off & 15) == 0;
+                    if (win) {
+                        bool himatch = !wide || (gv_is_cb(hi) && hi.cb == 0 && hi.off == lo.off + 4);
+                        x.cls = himatch ? GT_A : GT_A_LO;
+                        x.slot = (int8_t)((lo.off - base) >> 4);
+                        x.dyn = lo.k == GV_CBD;
+                        x.off_c = lo.c;
+                    } else if (base == 0x310 && lo.cb == 0 && lo.off >= 0x210 && lo.off < 0x310 && (lo.off & 15) == 0) {
+                        x.cls = GT_AU, x.slot = (int8_t)(16 + ((lo.off - 0x210) >> 4)), x.dyn = lo.k == GV_CBD, x.off_c = lo.c;
+                        if (wide && !(gv_is_cb(hi) && hi.cb == 0 && hi.off == lo.off + 4)) x.cls = GT_A_LO;
+                    } else x.cls = GT_B, x.cb = lo.cb, x.cboff = lo.off;
+                }
+                if (R.nacc == cap) R.acc = realloc(R.acc, sizeof(GtAcc) * (cap *= 2));
+                R.acc[R.nacc++] = x;
+            }
+            gt_step(X, w);
+        }
+    }
+    free(pop); free(X); free(brxt); free(brxn); free(lead); free(ssy); free(pbk); free(pcnt); free(blk_of); free(bfirst); free(blast); free(in); free(inq); free(q); free(succ);
+    return R;
+}
+
+// The plan for one vertex / fragment program (maxwell_gmem_ssbo): which LDG reads which storage slot (c->gss_slot), and
+// whether every global access is such a load (c->gss_only: then, with the copies' table, the shader takes no heap).
+static void gss_plan(Ctx *c, const uint8_t *code, size_t end, const uint8_t *cdata, size_t clen) {
+    uint64_t *cw = malloc((end + 1) * 8);  // (aligned)
+    memcpy(cw, code, end * 8);
+    GtResult r = gt_analyze(cw, end, c->stage == STAGE_FRAGMENT ? 0x510u : 0x110u, cdata, clen);
+    free(cw);
+    if (r.nacc) {
+        c->gss_slot = malloc(end + 1);
+        memset(c->gss_slot, -1, end + 1);
+        bool all = true;
+        for (int i = 0; i < r.nacc; i++) {
+            const GtAcc *x = &r.acc[i];
+            if (x->kind == 0 && x->cls == GT_A && x->slot >= 0 && x->slot < 16) c->gss_slot[x->pc / 8] = x->slot;
+            else all = false;
+        }
+        c->gss_only = all && maxwell_gmem_mirror;
+    }
+    free(r.acc);
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2899,6 +3509,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             any_branch = true;
         (void)is_branch_target_op;
     }
+    if (c->glsl && maxwell_gmem_ssbo && (stage == STAGE_VERTEX || stage == STAGE_FRAGMENT))
+        gss_plan(c, code, end, maxwell_const_data ? maxwell_const_data : blob + max_size, maxwell_const_data ? maxwell_const_size : 1024);
     if (any_branch && c->glsl) {
         static int ss = -1;
         if (ss < 0) { const char *e = getenv("LARECOMP_VK_STATIC_STACKS"); ss = e ? atoi(e) != 0 : maxwell_glsl_structured; }
@@ -2969,6 +3581,8 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     ast_free(plan); free(sblk); free(blk_of);
     free(c->pop_target);
     c->pop_target = NULL;
+    free(c->gss_slot);
+    c->gss_slot = NULL;
     // (MSL: more textures than sampler slots take a slot table, at a buffer index the vertex stage's streams use)
     if (!c->glsl && stage == STAGE_VERTEX && info->ntex > MSL_MAX_SAMPLERS)
         fail(c, "%d textures in a vertex shader (Metal: %d samplers)", info->ntex, MSL_MAX_SAMPLERS);
