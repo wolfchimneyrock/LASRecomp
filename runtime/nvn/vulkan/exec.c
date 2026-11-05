@@ -3557,8 +3557,9 @@ static void snap_apply(int stage, uint32_t read_mask) {
 
 // The driver constants of a graphics stage (cbuf 0, size bytes): zero but for the stage's storage buffer table at
 // base (16 bytes an entry: address low, high, size). Compared by the entries within size.
+static uint32_t gss_bias[2][16];  // (LARECOMP_VK_GMEM_SSBO) the driver constants' fourth word of each entry (gss_prepare)
 static VkSpan drv_dedupe(int stage, uint64_t size) {
-    static struct { uint64_t seq, size; int stage; Range sb[16]; VkSpan span; } last[2];
+    static struct { uint64_t seq, size; int stage; Range sb[16]; uint32_t bias[16]; VkSpan span; } last[2];
     int slot = stage == 1;
     uint32_t base = 0x110 + 0x100 * (stage == 1 ? 4 : 0);
     int ne = size > base ? (int)((size - base + 15) / 16) : 0;
@@ -3566,7 +3567,7 @@ static VkSpan drv_dedupe(int stage, uint64_t size) {
     uint64_t seq = vk_pending_seq();
     const Range *sb = sbufs(stage);  // (overlap: a snapshotted range's copy)
     if (last[slot].seq == seq && last[slot].size == size && last[slot].stage == stage &&
-        !memcmp(last[slot].sb, sb, (size_t)ne * sizeof(Range))) {
+        !memcmp(last[slot].sb, sb, (size_t)ne * sizeof(Range)) && !memcmp(last[slot].bias, gss_bias[slot], sizeof gss_bias[slot])) {
         prof_cb_reused++;
         return last[slot].span;
     }
@@ -3577,10 +3578,12 @@ static VkSpan drv_dedupe(int stage, uint64_t size) {
         e[0] = (uint32_t)sb[i].addr;
         e[1] = (uint32_t)(sb[i].addr >> 32);
         e[2] = (uint32_t)sb[i].size;
+        e[3] = gss_bias[slot][i];
     }
     VkSpan s = vk_transient_copy(drv, size, 256);
     last[slot].seq = seq; last[slot].size = size; last[slot].stage = stage; last[slot].span = s;
     memcpy(last[slot].sb, sb, (size_t)ne * sizeof(Range));
+    memcpy(last[slot].bias, gss_bias[slot], sizeof gss_bias[slot]);
     prof_cb_copied++;
     return s;
 }
@@ -3610,6 +3613,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 e[0] = (uint32_t)sb[i].addr;
                 e[1] = (uint32_t)(sb[i].addr >> 32);
                 e[2] = (uint32_t)sb[i].size;
+                e[3] = gss_bias[stage == 1][i];
             }
         }
         uint64_t size = si->cbuf_size[0] > sizeof drv ? sizeof drv : (si->cbuf_size[0] ? si->cbuf_size[0] : 256);
@@ -4205,11 +4209,13 @@ static uint32_t gmem_chunk_shift(void) {
     pthread_once(&gc_decide_once, gmem_chunk_decide);
     return (uint32_t)gc_shift_decided;
 }
+static void gss_decide(bool mirror);
 static void gmem_chunk_decide(void) {
     if (gmir_on()) {  // (copies: no heap binding at all, every stage goes through the table)
         gc_lazy = false, gc_shift = 0, gc_n = 0;
         maxwell_gmem_lazy = maxwell_gmem_fs_miss = false;
         maxwell_gmem_mirror = true;
+        gss_decide(true);
         gc_shift_decided = 0;
         return;
     }
@@ -4250,7 +4256,19 @@ static void gmem_chunk_decide(void) {
     if (maxwell_gmem_fs_miss) LOG("[vk] lazy chunks: every fragment shader counts misses, no early tests (LARECOMP_VK_GMEM_FS_MISS)\n");
     if (shift) LOG("[vk] guest heap bound to shaders in %llu MB %s (storage buffers up to %llu MB here)\n",
                    (unsigned long long)(1ull << shift) >> 20, gc_lazy ? "chunks, imported as the game binds them" : "windows", (unsigned long long)lim >> 20);
+    if (!shift) gss_decide(false);
     gc_shift_decided = shift;
+}
+
+// LARECOMP_VK_GMEM_SSBO=1 / =0 (gss_prepare): vertex / fragment loads traced to a storage slot read it as their own
+// buffer. Default: on with the copies' table (no heap import: Turnip, PanVK without the driver-memory heap), where
+// it replaces the table lookup (gfind) and a shader of such loads alone takes no heap; off where the heap is one
+// buffer (an import, the driver-memory heap: no copies to save). Never with heap chunks.
+static void gss_decide(bool mirror) {
+    const char *e = getenv("LARECOMP_VK_GMEM_SSBO");
+    maxwell_gmem_ssbo = e ? atoi(e) != 0 : mirror;
+    if (maxwell_gmem_ssbo) LOG("[vk] storage buffers the shaders' loads trace to: bound as their own (%s)\n",
+                               mirror ? "copies of their ranges" : "ranges of the heap");
 }
 
 // The heap mapped so far, as the imports see it (SetHeapSize; pages beyond it don't exist yet).
@@ -4976,6 +4994,69 @@ static void gmir_cpu_changes(GmirSlot *m, VkCommandBuffer cb) {
     if (any) vk_full_barrier(cb);
 }
 
+// Where guest range [lo, hi) (word-aligned) sits in gmir_buf for the draw or dispatch being recorded (gmir_lock held):
+// the GPU's own copy where a storing dispatch made one, else this submission's read-only copy (made now); ~0 when it
+// doesn't fit. store && !ro: a dispatch that stores there (a slot of its own; gmir_stored). cb as gmir_table's.
+static uint64_t gmir_place_locked(int stage, uint64_t lo, uint64_t hi, bool store, bool ro, VkCommandBuffer cb, uint64_t pending) {
+    uint64_t off = ~0ull;
+    GmirSlot *slot = NULL;
+    for (int k = 0; k < GMIR_SLOTS && !slot; k++)
+        if (gmir_slot[k].used && gmir_slot[k].lo <= lo && hi <= gmir_slot[k].hi) slot = &gmir_slot[k];
+    if (!slot && store && !ro) {  // a new GPU copy, starting from the CPU's
+        // (slots unused for ~600 submissions make room first - a level's buffers, gone; full: the least recently
+        // used idle one goes - some dispatches store to small buffers at a new address each frame)
+        if (pending > 600) gmir_slot_reclaim(pending - 600, false);
+        int k = 0;
+        uint64_t at = ~0ull;
+        for (int tries = 0; tries < 8; tries++) {
+            for (k = 0; k < GMIR_SLOTS && gmir_slot[k].used; k++) {}
+            if (k < GMIR_SLOTS && (at = gmir_slot_place(hi - lo)) != ~0ull) break;
+            if (!gmir_slot_reclaim(0, true)) break;
+        }
+        if (at != ~0ull) {
+            slot = &gmir_slot[k];
+            *slot = (GmirSlot){.lo = lo, .hi = hi, .off = at, .used = true, .base = malloc(hi - lo)};
+            for (int j = 0; j < GMIR_RB; j++)
+                slot->rb_off[j] = at + (uint64_t)(j + 1) * gmir_stride(slot), slot->rb_base[j] = malloc(hi - lo);
+            memcpy(slot->base, (const void *)(uintptr_t)lo, hi - lo);
+            memcpy(gmir_ptr + at, slot->base, hi - lo);
+            vmaFlushAllocation(g_vk.vma, gmir_mem, at, hi - lo);
+            slot->checked_seq = pending;
+            stat_upload_bytes += hi - lo;
+        } else {
+            static int nlog;
+            if (nlog++ < 20) LOG("[vk] gmem copies: no slot for %llx+%llx: its stores are lost\n", (unsigned long long)lo,
+                                 (unsigned long long)(hi - lo));
+        }
+    }
+    if (slot) {
+        if (cb) gmir_cpu_changes(slot, cb);
+        else if (slot->gpu_seq < pending) gmir_cpu_changes(slot, vk_upload_cmd());
+        off = slot->off + (lo - slot->lo);
+        slot->last_use = pending;
+        if (store && !ro && gmir_nstored < 16) gmir_stored[gmir_nstored++] = slot;
+    } else {
+        for (int k = 0; k < 64 && off == ~0ull; k++)  // (the same range again in this submission: its copy)
+            if (gmir_memo[k].seq == pending && gmir_memo[k].lo == lo && gmir_memo[k].hi == hi) off = gmir_memo[k].off;
+        if (off == ~0ull) {
+            off = gmir_ring_alloc(hi - lo);
+            if (off == ~0ull) {
+                static int nlog;
+                if (nlog++ < 20) LOG("[vk] gmem copies: stage %d range %llx+%llx doesn't fit: reads zero\n", stage,
+                                     (unsigned long long)lo, (unsigned long long)(hi - lo));
+                return ~0ull;
+            }
+            memcpy(gmir_ptr + off, (const void *)(uintptr_t)lo, hi - lo);
+            vmaFlushAllocation(g_vk.vma, gmir_mem, off, hi - lo);
+            stat_upload_bytes += hi - lo;
+            gmir_memo[gmir_memo_at].lo = lo, gmir_memo[gmir_memo_at].hi = hi, gmir_memo[gmir_memo_at].seq = pending;
+            gmir_memo[gmir_memo_at].off = off;
+            gmir_memo_at = (gmir_memo_at + 1) % 64;
+        }
+    }
+    return off;
+}
+
 // The address table of a stage's storage buffers (gmap_tab's layout) for the draw or dispatch being recorded. store: a
 // dispatch that stores (its slots go to gmir_stored). cb: where CPU changes to slots can be recorded now (outside a
 // render pass), or NULL (a draw: the submission's upload buffer, while no dispatch of this submission stored there).
@@ -5016,61 +5097,8 @@ static void gmir_table(int stage, bool store, VkCommandBuffer cb, uint32_t *tab)
     int out = 0;
     for (int i = 0; i < m; i++) {
         uint64_t lo = r[i].lo, hi = r[i].hi, off = ~0ull;
-        GmirSlot *slot = NULL;
-        for (int k = 0; k < GMIR_SLOTS && !slot; k++)
-            if (gmir_slot[k].used && gmir_slot[k].lo <= lo && hi <= gmir_slot[k].hi) slot = &gmir_slot[k];
-        if (!slot && store && !r[i].ro) {  // a new GPU copy, starting from the CPU's
-            // (slots unused for ~600 submissions make room first - a level's buffers, gone; full: the least recently
-            // used idle one goes - some dispatches store to small buffers at a new address each frame)
-            if (pending > 600) gmir_slot_reclaim(pending - 600, false);
-            int k = 0;
-            uint64_t at = ~0ull;
-            for (int tries = 0; tries < 8; tries++) {
-                for (k = 0; k < GMIR_SLOTS && gmir_slot[k].used; k++) {}
-                if (k < GMIR_SLOTS && (at = gmir_slot_place(hi - lo)) != ~0ull) break;
-                if (!gmir_slot_reclaim(0, true)) break;
-            }
-            if (at != ~0ull) {
-                slot = &gmir_slot[k];
-                *slot = (GmirSlot){.lo = lo, .hi = hi, .off = at, .used = true, .base = malloc(hi - lo)};
-                for (int j = 0; j < GMIR_RB; j++)
-                    slot->rb_off[j] = at + (uint64_t)(j + 1) * gmir_stride(slot), slot->rb_base[j] = malloc(hi - lo);
-                memcpy(slot->base, (const void *)(uintptr_t)lo, hi - lo);
-                memcpy(gmir_ptr + at, slot->base, hi - lo);
-                vmaFlushAllocation(g_vk.vma, gmir_mem, at, hi - lo);
-                slot->checked_seq = pending;
-                stat_upload_bytes += hi - lo;
-            } else {
-                static int nlog;
-                if (nlog++ < 20) LOG("[vk] gmem copies: no slot for %llx+%llx: its stores are lost\n", (unsigned long long)lo,
-                                     (unsigned long long)(hi - lo));
-            }
-        }
-        if (slot) {
-            if (cb) gmir_cpu_changes(slot, cb);
-            else if (slot->gpu_seq < pending) gmir_cpu_changes(slot, vk_upload_cmd());
-            off = slot->off + (lo - slot->lo);
-            slot->last_use = pending;
-            if (store && !r[i].ro && gmir_nstored < 16) gmir_stored[gmir_nstored++] = slot;
-        } else {
-            for (int k = 0; k < 64 && off == ~0ull; k++)  // (the same range again in this submission: its copy)
-                if (gmir_memo[k].seq == pending && gmir_memo[k].lo == lo && gmir_memo[k].hi == hi) off = gmir_memo[k].off;
-            if (off == ~0ull) {
-                off = gmir_ring_alloc(hi - lo);
-                if (off == ~0ull) {
-                    static int nlog;
-                    if (nlog++ < 20) LOG("[vk] gmem copies: stage %d range %llx+%llx doesn't fit: reads zero\n", stage,
-                                         (unsigned long long)lo, (unsigned long long)(hi - lo));
-                    continue;
-                }
-                memcpy(gmir_ptr + off, (const void *)(uintptr_t)lo, hi - lo);
-                vmaFlushAllocation(g_vk.vma, gmir_mem, off, hi - lo);
-                stat_upload_bytes += hi - lo;
-                gmir_memo[gmir_memo_at].lo = lo, gmir_memo[gmir_memo_at].hi = hi, gmir_memo[gmir_memo_at].seq = pending;
-                gmir_memo[gmir_memo_at].off = off;
-                gmir_memo_at = (gmir_memo_at + 1) % 64;
-            }
-        }
+        off = gmir_place_locked(stage, lo, hi, store, r[i].ro, cb, pending);
+        if (off == ~0ull) continue;
         tab[out * 4 + 0] = (uint32_t)(lo - HEAP_BASE);
         tab[out * 4 + 1] = (uint32_t)(hi - lo);
         tab[out * 4 + 2] = (uint32_t)(off >> 2);
@@ -5576,6 +5604,59 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
 }
 
+// ---- storage slots as their own buffers (LARECOMP_VK_GMEM_SSBO; shader.h maxwell_gmem_ssbo, translate.c gss_plan)
+// A vertex / fragment shader's loads traced to storage slot k's descriptor read binding GSS_BINDING + k: here the
+// slot's range - out of the heap import or the driver-memory heap (buffer + offset), or with the copies' table
+// (gmir_on: no heap here) a copy of just that range (gmir_place_locked: the GPU's own copy where a storing dispatch
+// made one) - bound from an offset the device allows (minStorageBufferOffsetAlignment); the driver constants' fourth
+// word of the entry (gss_bias, drv_dedupe) says where the slot's address sits in the binding. Loads only: stores and
+// untraced accesses keep the heap / the table. A slot that can't be bound gets 16 zero bytes (its loads read 0).
+static VkDescriptorBufferInfo gss_info[2][16];
+static void gss_prepare(int stage, const ShaderInfo *si) {
+    memset(gss_bias[stage], 0, sizeof gss_bias[stage]);
+    if (!si->gss_mask) return;
+    const Range *sb = sbufs(stage);  // (overlap: a snapshotted range's copy, as the driver constants have it)
+    uint64_t align = g_vk.props.limits.minStorageBufferOffsetAlignment, lim = g_vk.props.limits.maxStorageBufferRange;
+    if (align < 4) align = 4;
+    if (!lim) lim = 1ull << 27;
+    uint64_t pending = vk_pending_seq();
+    for (int k = 0; k < 16; k++) {
+        if (!(si->gss_mask & (1u << k))) continue;
+        Range r = sb[k];
+        bool ok = false;
+        uint64_t at = 0, range = 0, bias = 0;
+        VkBuffer buf = VK_NULL_HANDLE;
+        if (r.addr && r.size && r.addr >= HEAP_BASE && r.addr + r.size <= HEAP_BASE + HEAP_MAX) {
+            if (gmir_on()) {
+                uint64_t lo = r.addr & ~3ull, hi = (r.addr + r.size + 3) & ~3ull;
+                gmir_init();
+                pthread_mutex_lock(&gmir_lock);
+                uint64_t off = gmir_place_locked(stage, lo, hi, false, true, NULL, pending);
+                pthread_mutex_unlock(&gmir_lock);
+                if (off != ~0ull) {
+                    at = off & ~(align - 1), range = off - at + (hi - lo), bias = off - at + (r.addr - lo);
+                    buf = gmir_buf, ok = true;
+                }
+            } else if (!gc_shift) {
+                VkDescriptorBufferInfo h = gmem_info();
+                uint64_t o = r.addr - HEAP_BASE;
+                if (gmem_buf && h.buffer == gmem_buf && o + r.size <= h.range) {
+                    at = o & ~(align - 1), range = o - at + r.size, bias = o - at;
+                    buf = gmem_buf, ok = true;
+                }
+            }
+        }
+        if (ok && range > lim) range = lim & ~3ull;  // (the slot's start is inside: the loads past the limit read 0)
+        if (!ok) {
+            static const uint32_t zero[4];
+            VkSpan z = vk_transient_copy(zero, sizeof zero, 256);
+            buf = z.buf, at = z.off, range = sizeof zero, bias = 0;
+        }
+        gss_info[stage][k] = (VkDescriptorBufferInfo){buf, at, range};
+        gss_bias[stage][k] = (uint32_t)bias;
+    }
+}
+
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
@@ -5602,6 +5683,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     rs[0][0] = rs[0][1] = 1; rs[0][2] = rs[0][3] = 0;
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     rs[65][0] = g_mirror_w; rs[65][1] = rs[65][2] = rs[65][3] = 0;
+    if (stage < 2) gss_prepare(stage, si);  // (before the driver constants: their entries' fourth words)
     for (int i = 0; i < p->nbinds; i++) {
         VkBindingInfo *b = &p->binds[i];
         if (b->set != set) continue;
@@ -5624,6 +5706,9 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             w[n].pImageInfo = &ii[n];
         } else if (is_ubo(b->type) && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
+            w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && b->binding >= GSS_BINDING && b->binding < GSS_BINDING + 16 && stage < 2) {
+            bi[n] = gss_info[stage][b->binding - GSS_BINDING];
             w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = b->binding != GFAST_BUFFER_INDEX ? gmem_info()
